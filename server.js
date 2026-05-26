@@ -30,6 +30,24 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ============================================================
+// SANITIZATION
+// Treat common "no data" sentinel strings as empty so they
+// don't get stored as real values and matched against each other.
+// ============================================================
+const SENTINEL_VALUES = new Set([
+  '', 'not found', 'n/a', 'na', 'none', 'null', 'unknown',
+  '-', '--', '#n/a', '#null', 'nil', 'no data', 'tbd', 'pending'
+]);
+
+function blank(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v).trim();
+  if (!s) return '';
+  if (SENTINEL_VALUES.has(s.toLowerCase())) return '';
+  return s;
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS batches (
@@ -221,6 +239,10 @@ function findDuplicates(leads) {
   return groups;
 }
 
+// ============================================================
+// ROUTES
+// ============================================================
+
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.get('/api/stats', requireAuth, async (req, res) => {
@@ -275,7 +297,7 @@ app.post('/api/batches', requireAuth, async (req, res) => {
 
     const batchResult = await client.query(
       'INSERT INTO batches (name, lead_info_api, lead_count) VALUES ($1, $2, $3) RETURNING id, uploaded_at',
-      [name || 'Untitled', leadInfoApi || '', leads.length]
+      [blank(name) || 'Untitled', blank(leadInfoApi), leads.length]
     );
     const batchId = batchResult.rows[0].id;
 
@@ -286,22 +308,27 @@ app.post('/api/batches', requireAuth, async (req, res) => {
       const placeholders = [];
       let pi = 1;
       for (const l of slice) {
-        const fullName = ((l.firstName || '') + ' ' + (l.lastName || '')).trim().toLowerCase();
-        const normPhone = normalizePhone(l.phone);
+        const cFirst = blank(l.firstName);
+        const cLast = blank(l.lastName);
+        const cCompany = blank(l.company);
+        const cEmail = blank(l.email).toLowerCase();
+        const cPhone = blank(l.phone);
+        const fullName = (cFirst + ' ' + cLast).trim().toLowerCase();
+        const normPhone = normalizePhone(cPhone);
         placeholders.push(`($${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++},$${pi++})`);
         values.push(
           batchId,
           l.dateStr || null,
-          l.source || '',
-          l.leadInfoApi || '',
-          l.leadDateApi || '',
-          l.firstName || '',
-          l.lastName || '',
+          blank(l.source),
+          blank(l.leadInfoApi),
+          blank(l.leadDateApi),
+          cFirst,
+          cLast,
           fullName,
-          (l.email || '').toLowerCase(),
-          l.phone || '',
+          cEmail,
+          cPhone,
           normPhone,
-          l.company || ''
+          cCompany
         );
       }
       await client.query(
