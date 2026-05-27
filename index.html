@@ -115,15 +115,15 @@
     margin-bottom: 20px;
   }
   .stat-card { background: white; padding: 16px; border-radius: 8px; text-align: center; border: 2px solid #e2e8f0; }
-  .stat-card.critical { background: rgba(220, 38, 38, 0.1); border-color: #dc2626; }
-  .stat-card.high { background: rgba(234, 88, 12, 0.1); border-color: #ea580c; }
-  .stat-card.medium { background: rgba(234, 179, 8, 0.1); border-color: #eab308; }
-  .stat-card.regular { background: rgba(99, 102, 241, 0.1); border-color: #6366f1; }
+  .stat-card.exact    { background: rgba(16, 185, 129, 0.1); border-color: #10b981; }
+  .stat-card.strong   { background: rgba(59, 130, 246, 0.1); border-color: #3b82f6; }
+  .stat-card.probable { background: rgba(245, 158, 11, 0.1); border-color: #f59e0b; }
+  .stat-card.fuzzy    { background: rgba(139, 92, 246, 0.1); border-color: #8b5cf6; }
   .stat-num { font-size: 28px; font-weight: 700; }
-  .stat-num.critical { color: #dc2626; }
-  .stat-num.high { color: #ea580c; }
-  .stat-num.medium { color: #eab308; }
-  .stat-num.regular { color: #6366f1; }
+  .stat-num.exact    { color: #10b981; }
+  .stat-num.strong   { color: #3b82f6; }
+  .stat-num.probable { color: #f59e0b; }
+  .stat-num.fuzzy    { color: #8b5cf6; }
   .stat-lbl { font-size: 12px; color: #64748b; margin-top: 4px; }
 
   .batch-list { display: flex; flex-direction: column; gap: 8px; }
@@ -141,6 +141,19 @@
   .batch-name { font-weight: 600; color: #1e293b; font-size: 15px; }
   .batch-meta { font-size: 12px; color: #64748b; margin-top: 2px; }
   .batch-lead-count { background: #4f46e5; color: white; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .batch-name-input {
+    font-weight: 600;
+    color: #1e293b;
+    font-size: 15px;
+    border: 2px solid #4f46e5;
+    border-radius: 4px;
+    padding: 2px 6px;
+    width: 100%;
+    font-family: inherit;
+    outline: none;
+  }
+  .batch-name.editable { cursor: text; padding: 2px 4px; border-radius: 4px; }
+  .batch-name.editable:hover { background: #e0e7ff; }
 
   .dup-group {
     background: white;
@@ -150,20 +163,21 @@
     padding: 14px 16px;
     margin-bottom: 10px;
   }
-  .dup-group.critical { border-left-color: #dc2626; background: rgba(220, 38, 38, 0.05); }
-  .dup-group.high { border-left-color: #ea580c; background: rgba(234, 88, 12, 0.05); }
-  .dup-group.medium { border-left-color: #eab308; background: rgba(234, 179, 8, 0.05); }
-  .dup-group.regular { border-left-color: #6366f1; background: rgba(99, 102, 241, 0.05); }
+  .dup-group.exact    { border-left-color: #10b981; background: rgba(16, 185, 129, 0.05); }
+  .dup-group.strong   { border-left-color: #3b82f6; background: rgba(59, 130, 246, 0.05); }
+  .dup-group.probable { border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.05); }
+  .dup-group.fuzzy    { border-left-color: #8b5cf6; background: rgba(139, 92, 246, 0.05); }
   .dup-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; font-weight: 600; }
 
   .badge { padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; color: white; }
-  .badge.critical { background: #dc2626; }
-  .badge.high { background: #ea580c; }
-  .badge.medium { background: #eab308; }
-  .badge.regular { background: #6366f1; }
-  .badge.count { background: #f59e0b; }
+  .badge.exact    { background: #10b981; }
+  .badge.strong   { background: #3b82f6; }
+  .badge.probable { background: #f59e0b; }
+  .badge.fuzzy    { background: #8b5cf6; }
+  .badge.count       { background: #64748b; }
   .badge.cross-batch { background: #8b5cf6; }
-  .badge.same-batch { background: #06b6d4; }
+  .badge.same-batch  { background: #06b6d4; }
+  .badge.sources     { background: #0ea5e9; }
 
   .dup-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
   .dup-table th { background: #f1f5f9; padding: 6px 8px; text-align: left; font-size: 11px; font-weight: 600; color: #475569; text-transform: uppercase; }
@@ -241,7 +255,7 @@
 </head>
 <body>
 <div class="container">
-  <h1>📊 PMF Lead Database</h1>
+  <h1>PMF Lead Database</h1>
   <p class="subtitle">Persistent backend. Auto-deduplicates across every batch you upload.</p>
 
   <div id="configBanner" class="config-banner hidden"></div>
@@ -251,13 +265,12 @@
     <div><div class="db-stat-num" id="dbTotalBatches">—</div><div class="db-stat-label">Uploaded Batches</div></div>
     <div><div class="db-stat-num" id="dbTotalDupes">—</div><div class="db-stat-label">Duplicate Groups</div></div>
     <div><div class="db-stat-num" id="dbLastUpdate" style="font-size:16px;">—</div><div class="db-stat-label">Last Update</div></div>
-    <div><button class="btn btn-small btn-red" onclick="confirmClearDb()">🗑️ Clear DB</button></div>
+    <div><button class="btn btn-small btn-red" onclick="confirmClearDb()">Clear DB</button></div>
   </div>
 
   <div class="section">
-    <h2>📥 Upload New Batch</h2>
+    <h2>Upload New Batch</h2>
     <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
-      <div style="font-size:36px; margin-bottom:8px;">📁</div>
       <h3 id="fileName">Click to upload CSV file</h3>
       <p class="text-muted mt-2">Each upload becomes a new batch in the database</p>
       <input type="file" id="fileInput" accept=".csv" style="display:none;">
@@ -276,37 +289,37 @@
   <div id="mainSection" class="hidden">
     <div class="section">
       <div class="tabs">
-        <button class="tab active" data-tab="duplicates" onclick="switchTab('duplicates')">🔍 All Duplicates</button>
-        <button class="tab" data-tab="byBatch" onclick="switchTab('byBatch')">📦 By Batch</button>
-        <button class="tab" data-tab="byPriority" onclick="switchTab('byPriority')">🚦 By Priority</button>
-        <button class="tab" data-tab="batches" onclick="switchTab('batches')">📋 Manage Batches</button>
+        <button class="tab active" data-tab="duplicates" onclick="switchTab('duplicates')">All Duplicates</button>
+        <button class="tab" data-tab="byBatch" onclick="switchTab('byBatch')">By Batch</button>
+        <button class="tab" data-tab="byTier" onclick="switchTab('byTier')">By Tier</button>
+        <button class="tab" data-tab="batches" onclick="switchTab('batches')">Manage Batches</button>
       </div>
 
       <div id="tab-duplicates" class="tab-content">
         <div class="stats-grid">
-          <div class="stat-card critical"><div class="stat-num critical" id="crit30">0</div><div class="stat-lbl">🔴 0-30 Days</div></div>
-          <div class="stat-card high"><div class="stat-num high" id="high60">0</div><div class="stat-lbl">🟠 31-60 Days</div></div>
-          <div class="stat-card medium"><div class="stat-num medium" id="med90">0</div><div class="stat-lbl">🟡 61-90 Days</div></div>
-          <div class="stat-card regular"><div class="stat-num regular" id="reg365">0</div><div class="stat-lbl">🔵 91-365 Days</div></div>
+          <div class="stat-card exact"><div class="stat-num exact" id="cntExact">0</div><div class="stat-lbl">Exact</div></div>
+          <div class="stat-card strong"><div class="stat-num strong" id="cntStrong">0</div><div class="stat-lbl">Strong</div></div>
+          <div class="stat-card probable"><div class="stat-num probable" id="cntProbable">0</div><div class="stat-lbl">Probable</div></div>
+          <div class="stat-card fuzzy"><div class="stat-num fuzzy" id="cntFuzzy">0</div><div class="stat-lbl">Fuzzy</div></div>
         </div>
 
         <div class="export-buttons mb-2">
-          <button class="btn btn-small btn-green" onclick="exportDuplicates('all')">📊 Export All</button>
-          <button class="btn btn-small" style="background:#dc2626;" onclick="exportDuplicates('critical')">🔴 Critical</button>
-          <button class="btn btn-small" style="background:#ea580c;" onclick="exportDuplicates('high')">🟠 High</button>
-          <button class="btn btn-small" style="background:#eab308;" onclick="exportDuplicates('medium')">🟡 Medium</button>
-          <button class="btn btn-small" style="background:#6366f1;" onclick="exportDuplicates('regular')">🔵 Regular</button>
-          <button class="btn btn-small" style="background:#8b5cf6;" onclick="exportDuplicates('crossBatch')">🟣 Cross-Batch</button>
+          <button class="btn btn-small btn-green" onclick="exportDuplicates('all')">Export All</button>
+          <button class="btn btn-small" style="background:#10b981;" onclick="exportDuplicates('exact')">Exact</button>
+          <button class="btn btn-small" style="background:#3b82f6;" onclick="exportDuplicates('strong')">Strong</button>
+          <button class="btn btn-small" style="background:#f59e0b;" onclick="exportDuplicates('probable')">Probable</button>
+          <button class="btn btn-small" style="background:#8b5cf6;" onclick="exportDuplicates('fuzzy')">Fuzzy</button>
+          <button class="btn btn-small" style="background:#0ea5e9;" onclick="exportDuplicates('crossBatch')">Cross-Batch</button>
         </div>
 
-        <input type="text" class="search-input" id="searchInput" placeholder="🔍 Search by name, company, email, phone, batch, lead source...">
+        <input type="text" class="search-input" id="searchInput" placeholder="Search by name, company, email, phone, batch, lead source...">
         <div id="searchInfo" class="text-muted mb-2"></div>
 
         <div id="duplicatesList"></div>
       </div>
 
       <div id="tab-byBatch" class="tab-content hidden"><div id="byBatchList"></div></div>
-      <div id="tab-byPriority" class="tab-content hidden"><div id="byPriorityList"></div></div>
+      <div id="tab-byTier" class="tab-content hidden"><div id="byTierList"></div></div>
       <div id="tab-batches" class="tab-content hidden">
         <h3>All Uploaded Batches</h3>
         <p class="text-muted mb-2">Click delete to remove a batch and its leads from the database.</p>
@@ -464,7 +477,7 @@ function buildLeadsFromData(fileData) {
 }
 
 function buildDiagnosticHtml(d) {
-  const fmtCol = v => v ? `<b style="color:#059669;">${v}</b>` : `<b style="color:#dc2626;">❌ NOT FOUND</b>`;
+  const fmtCol = v => v ? `<b style="color:#059669;">${v}</b>` : `<b style="color:#dc2626;">NOT FOUND</b>`;
   const c = d.columns;
   const nameDisplay = (c.firstName && c.lastName)
     ? `FirstName=${fmtCol(c.firstName)}, LastName=${fmtCol(c.lastName)}`
@@ -483,8 +496,8 @@ function buildDiagnosticHtml(d) {
 // ============================================================
 // HELPERS
 // ============================================================
-function getPriorityLabel(level) {
-  return { critical: '🔴 0-30 days', high: '🟠 31-60 days', medium: '🟡 61-90 days', regular: '🔵 91-365 days', none: '⚪ 365+ days' }[level] || level;
+function getTierLabel(tier) {
+  return { exact: 'Exact', strong: 'Strong', probable: 'Probable', fuzzy: 'Fuzzy' }[tier] || tier;
 }
 
 function showStatus(html, type) {
@@ -526,7 +539,7 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
   pendingFile = file;
-  document.getElementById('fileName').textContent = '✓ ' + file.name;
+  document.getElementById('fileName').textContent = file.name;
   document.getElementById('uploadArea').classList.add('loaded');
 
   const reader = new FileReader();
@@ -549,7 +562,7 @@ document.getElementById('processBtn').addEventListener('click', async () => {
   if (parsed.leads.length === 0) {
     setProgressVisible(false);
     document.getElementById('processBtn').disabled = false;
-    showStatus('⚠️ No leads could be parsed.<br>' + buildDiagnosticHtml(parsed.diagnostics), 'error');
+    showStatus('No leads could be parsed.<br>' + buildDiagnosticHtml(parsed.diagnostics), 'error');
     return;
   }
 
@@ -591,7 +604,7 @@ document.getElementById('processBtn').addEventListener('click', async () => {
   } catch (err) {
     setProgressVisible(false);
     document.getElementById('processBtn').disabled = false;
-    showStatus(`❌ Upload failed: ${escapeHtml(err.message)}`, 'error');
+    showStatus(`Upload failed: ${escapeHtml(err.message)}`, 'error');
   }
 });
 
@@ -600,7 +613,7 @@ function renderLastUploadSummary(info) {
   el.classList.remove('hidden');
   el.innerHTML = `
     <div class="upload-summary">
-      <div style="font-size:18px; font-weight:700;">✓ Batch Added: ${escapeHtml(info.batchName)}</div>
+      <div style="font-size:18px; font-weight:700;">Batch Added: ${escapeHtml(info.batchName)}</div>
       <div style="font-size:13px; opacity:0.95; margin-top:2px;">Lead Info API: <b>${escapeHtml(info.leadInfoApi)}</b></div>
       <div class="upload-summary-grid">
         <div><div class="upload-summary-num">${info.newLeadsCount.toLocaleString()}</div><div class="upload-summary-lbl">New Leads</div></div>
@@ -628,7 +641,7 @@ async function refreshAll() {
     cachedGroups = dupResult.groups || [];
     renderEverything();
   } catch (err) {
-    showStatus(`❌ Could not load database: ${escapeHtml(err.message)}<br><span class="text-muted">If this is the first load after the server slept, wait 30s and refresh the page — Render free tier wakes up on demand.</span>`, 'error');
+    showStatus(`Could not load database: ${escapeHtml(err.message)}<br><span class="text-muted">If this is the first load after the server slept, wait 30s and refresh the page — Render free tier wakes up on demand.</span>`, 'error');
   }
 }
 
@@ -638,16 +651,16 @@ function renderEverything() {
   document.getElementById('dbTotalDupes').textContent = cachedGroups.length.toLocaleString();
   document.getElementById('dbLastUpdate').textContent = cachedStats.last_update ? new Date(cachedStats.last_update).toLocaleDateString() : 'Never';
 
-  const counts = { critical: 0, high: 0, medium: 0, regular: 0 };
-  cachedGroups.forEach(g => { if (counts[g.priority] !== undefined) counts[g.priority]++; });
-  document.getElementById('crit30').textContent = counts.critical.toLocaleString();
-  document.getElementById('high60').textContent = counts.high.toLocaleString();
-  document.getElementById('med90').textContent = counts.medium.toLocaleString();
-  document.getElementById('reg365').textContent = counts.regular.toLocaleString();
+  const counts = { exact: 0, strong: 0, probable: 0, fuzzy: 0 };
+  cachedGroups.forEach(g => { if (counts[g.matchTier] !== undefined) counts[g.matchTier]++; });
+  document.getElementById('cntExact').textContent = counts.exact.toLocaleString();
+  document.getElementById('cntStrong').textContent = counts.strong.toLocaleString();
+  document.getElementById('cntProbable').textContent = counts.probable.toLocaleString();
+  document.getElementById('cntFuzzy').textContent = counts.fuzzy.toLocaleString();
 
   renderDuplicatesList();
   renderByBatchList();
-  renderByPriorityList();
+  renderByTierList();
   renderBatchManagementList();
 
   document.getElementById('mainSection').classList.remove('hidden');
@@ -669,14 +682,14 @@ function renderDuplicatesList(filter = '') {
   }
 
   if (groups.length === 0) {
-    container.innerHTML = `<div class="empty-state"><div class="icon">🔍</div><div>No duplicates${filter ? ' match this search' : ' yet'}.</div></div>`;
+    container.innerHTML = `<div class="empty-state"><div>No duplicates${filter ? ' match this search' : ' yet'}.</div></div>`;
     return;
   }
 
-  const priOrder = { critical: 0, high: 1, medium: 2, regular: 3, none: 4 };
+  const tierOrder = { exact: 0, strong: 1, probable: 2, fuzzy: 3 };
   groups = [...groups].sort((a, b) => {
-    const p = (priOrder[a.priority] ?? 99) - (priOrder[b.priority] ?? 99);
-    if (p !== 0) return p;
+    const t = (tierOrder[a.matchTier] ?? 99) - (tierOrder[b.matchTier] ?? 99);
+    if (t !== 0) return t;
     return b.occurrenceCount - a.occurrenceCount;
   });
 
@@ -701,13 +714,22 @@ function renderDupGroup(group) {
     </tr>
   `).join('');
 
+  const sourceBadge = (group.sourceCount && group.sourceCount > 1)
+    ? `<span class="badge sources">${group.sourceCount} sources</span>`
+    : '';
+
+  const batchBadge = group.isCrossBatch
+    ? `<span class="badge cross-batch">${group.batchCount} batches</span>`
+    : `<span class="badge same-batch">Same batch</span>`;
+
   return `
-    <div class="dup-group ${group.priority}">
+    <div class="dup-group ${group.matchTier}">
       <div class="dup-header">
         <span>${escapeHtml(first.firstName)} ${escapeHtml(first.lastName)} — ${escapeHtml(first.company || 'No Company')}</span>
-        <span class="badge ${group.priority}">${getPriorityLabel(group.priority)}</span>
-        <span class="badge count">📊 Appears ${group.occurrenceCount}x</span>
-        ${group.isCrossBatch ? `<span class="badge cross-batch">🟣 ${group.batchCount} batches</span>` : `<span class="badge same-batch">🔵 Same batch</span>`}
+        <span class="badge ${group.matchTier}">${getTierLabel(group.matchTier)}</span>
+        <span class="badge count">Appears ${group.occurrenceCount}x</span>
+        ${sourceBadge}
+        ${batchBadge}
       </div>
       <table class="dup-table">
         <thead><tr><th>Date</th><th>Batch</th><th>Lead Info API (row)</th><th>Company</th><th>Email</th><th>Phone</th><th>Match Type</th></tr></thead>
@@ -720,7 +742,7 @@ function renderDupGroup(group) {
 function renderByBatchList() {
   const container = document.getElementById('byBatchList');
   if (!cachedBatches || cachedBatches.length === 0) {
-    container.innerHTML = `<div class="empty-state"><div class="icon">📦</div><div>No batches yet.</div></div>`;
+    container.innerHTML = `<div class="empty-state"><div>No batches yet.</div></div>`;
     return;
   }
   container.innerHTML = cachedBatches.map(b => {
@@ -730,7 +752,7 @@ function renderByBatchList() {
     return `
       <details>
         <summary>
-          📦 ${escapeHtml(b.name)} — ${b.lead_count} leads —
+          ${escapeHtml(b.name)} — ${b.lead_count} leads —
           <span class="badge cross-batch">${crossBatchCount} cross-batch</span>
           <span class="badge same-batch">${sameBatchCount} same-batch</span>
         </summary>
@@ -744,47 +766,102 @@ function renderByBatchList() {
   }).join('');
 }
 
-function renderByPriorityList() {
-  const container = document.getElementById('byPriorityList');
-  const priorities = ['critical', 'high', 'medium', 'regular'];
+function renderByTierList() {
+  const container = document.getElementById('byTierList');
+  const tiers = ['exact', 'strong', 'probable', 'fuzzy'];
   const labels = {
-    critical: '🔴 CRITICAL (0-30 Days)',
-    high: '🟠 HIGH (31-60 Days)',
-    medium: '🟡 MEDIUM (61-90 Days)',
-    regular: '🔵 REGULAR (91-365 Days)'
+    exact:    'Exact',
+    strong:   'Strong',
+    probable: 'Probable',
+    fuzzy:    'Fuzzy'
   };
-  const html = priorities.map(p => {
-    const groupsForP = cachedGroups.filter(g => g.priority === p);
-    if (groupsForP.length === 0) return '';
+  const descriptions = {
+    exact:    'All four fields (name, email, phone, company) identical.',
+    strong:   'Name + email/phone match, with company verified ≥85% similar.',
+    probable: 'Name + email/phone match, but company differs or is blank.',
+    fuzzy:    'Name + company 75–84% similar, or same business with different contacts.'
+  };
+  const defaultOpen = { exact: true, strong: true, probable: false, fuzzy: false };
+  const html = tiers.map(t => {
+    const groupsForT = cachedGroups.filter(g => g.matchTier === t);
+    if (groupsForT.length === 0) return '';
     return `
-      <details ${p === 'critical' ? 'open' : ''}>
-        <summary>${labels[p]} — ${groupsForP.length} groups</summary>
+      <details ${defaultOpen[t] ? 'open' : ''}>
+        <summary>${labels[t]} — ${groupsForT.length} groups</summary>
         <div>
-          ${groupsForP.slice(0, 50).map(renderDupGroup).join('')}
-          ${groupsForP.length > 50 ? `<div class="text-center text-muted mt-2">Showing top 50 of ${groupsForP.length}. Export CSV to see all.</div>` : ''}
+          <div class="text-muted mb-2" style="font-size:12px;">${descriptions[t]}</div>
+          ${groupsForT.slice(0, 50).map(renderDupGroup).join('')}
+          ${groupsForT.length > 50 ? `<div class="text-center text-muted mt-2">Showing top 50 of ${groupsForT.length}. Export CSV to see all.</div>` : ''}
         </div>
       </details>
     `;
   }).join('');
-  container.innerHTML = html || `<div class="empty-state"><div class="icon">🚦</div><div>No duplicates yet.</div></div>`;
+  container.innerHTML = html || `<div class="empty-state"><div>No duplicates yet.</div></div>`;
 }
 
 function renderBatchManagementList() {
   const container = document.getElementById('batchManagementList');
   if (!cachedBatches || cachedBatches.length === 0) {
-    container.innerHTML = `<div class="empty-state"><div class="icon">📋</div><div>No batches uploaded yet.</div></div>`;
+    container.innerHTML = `<div class="empty-state"><div>No batches uploaded yet.</div></div>`;
     return;
   }
   container.innerHTML = cachedBatches.map(b => `
-    <div class="batch-item">
+    <div class="batch-item" data-batch-id="${b.id}">
       <div class="batch-info">
-        <div class="batch-name">📦 ${escapeHtml(b.name)}</div>
+        <div class="batch-name editable" onclick="startRenameBatch(${b.id}, this)" title="Click to rename">${escapeHtml(b.name)}</div>
         <div class="batch-meta">Lead Info API: <b>${escapeHtml(b.lead_info_api || '')}</b> · Uploaded: ${new Date(b.uploaded_at).toLocaleString()}</div>
       </div>
       <span class="batch-lead-count">${b.lead_count.toLocaleString()} leads</span>
       <button class="btn btn-tiny btn-red" onclick="deleteBatch(${b.id})">Delete</button>
     </div>
   `).join('');
+}
+
+function startRenameBatch(id, nameEl) {
+  const currentName = nameEl.textContent;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentName;
+  input.className = 'batch-name-input';
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const newName = input.value.trim();
+    const restore = (text) => {
+      const span = document.createElement('div');
+      span.className = 'batch-name editable';
+      span.setAttribute('onclick', `startRenameBatch(${id}, this)`);
+      span.setAttribute('title', 'Click to rename');
+      span.textContent = text;
+      input.replaceWith(span);
+    };
+    if (!save || !newName || newName === currentName) {
+      restore(currentName);
+      return;
+    }
+    try {
+      await api('PATCH', '/api/batches/' + id, { name: newName });
+      restore(newName);
+      // Update cached list so subsequent renders show the new name
+      const b = cachedBatches.find(x => x.id === id);
+      if (b) b.name = newName;
+      showStatus(`Batch renamed to "${escapeHtml(newName)}".`, 'success');
+    } catch (err) {
+      restore(currentName);
+      showStatus(`Rename failed: ${escapeHtml(err.message)}`, 'error');
+    }
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
 }
 
 // ============================================================
@@ -802,10 +879,10 @@ async function deleteBatch(id) {
   if (!confirm('Delete this batch and all its leads? Cannot be undone.')) return;
   try {
     await api('DELETE', '/api/batches/' + id);
-    showStatus('✓ Batch deleted.', 'success');
+    showStatus('Batch deleted.', 'success');
     await refreshAll();
   } catch (err) {
-    showStatus(`❌ Delete failed: ${escapeHtml(err.message)}`, 'error');
+    showStatus(`Delete failed: ${escapeHtml(err.message)}`, 'error');
   }
 }
 
@@ -813,11 +890,11 @@ async function confirmClearDb() {
   if (!confirm('Delete ALL batches and leads from the database? Cannot be undone.')) return;
   try {
     await api('POST', '/api/clear');
-    showStatus('✓ Database cleared.', 'success');
+    showStatus('Database cleared.', 'success');
     await refreshAll();
     document.getElementById('lastUploadSummary').classList.add('hidden');
   } catch (err) {
-    showStatus(`❌ Clear failed: ${escapeHtml(err.message)}`, 'error');
+    showStatus(`Clear failed: ${escapeHtml(err.message)}`, 'error');
   }
 }
 
@@ -827,10 +904,10 @@ async function confirmClearDb() {
 function exportDuplicates(scope) {
   let groups = cachedGroups;
   let filename = 'duplicates_all';
-  if (scope === 'critical') { groups = groups.filter(g => g.priority === 'critical'); filename = 'duplicates_critical'; }
-  else if (scope === 'high') { groups = groups.filter(g => g.priority === 'high'); filename = 'duplicates_high'; }
-  else if (scope === 'medium') { groups = groups.filter(g => g.priority === 'medium'); filename = 'duplicates_medium'; }
-  else if (scope === 'regular') { groups = groups.filter(g => g.priority === 'regular'); filename = 'duplicates_regular'; }
+  if (scope === 'exact')         { groups = groups.filter(g => g.matchTier === 'exact');    filename = 'duplicates_exact'; }
+  else if (scope === 'strong')   { groups = groups.filter(g => g.matchTier === 'strong');   filename = 'duplicates_strong'; }
+  else if (scope === 'probable') { groups = groups.filter(g => g.matchTier === 'probable'); filename = 'duplicates_probable'; }
+  else if (scope === 'fuzzy')    { groups = groups.filter(g => g.matchTier === 'fuzzy');    filename = 'duplicates_fuzzy'; }
   else if (scope === 'crossBatch') { groups = groups.filter(g => g.isCrossBatch); filename = 'duplicates_cross_batch'; }
 
   if (groups.length === 0) {
@@ -838,10 +915,10 @@ function exportDuplicates(scope) {
     return;
   }
 
-  let csv = 'Group ID,Priority,Occurrence Count,Cross-Batch,Date Received,Batch Name,Batch Lead Info API,Row Lead Info API,Lead Source,First Name,Last Name,Company,Email,Phone,Match Type\n';
+  let csv = 'Group ID,Tier,Occurrence Count,Source Count,Cross-Batch,Date Received,Batch Name,Batch Lead Info API,Row Lead Info API,Lead Source,First Name,Last Name,Company,Email,Phone,Match Type\n';
   groups.forEach((g, i) => {
     g.leads.forEach(l => {
-      csv += `"G${i+1}","${getPriorityLabel(g.priority)}","${g.occurrenceCount}","${g.isCrossBatch ? 'Yes' : 'No'}","${l.displayDate || ''}","${escapeCsv(l.batchName)}","${escapeCsv(l.batchLeadInfoApi)}","${escapeCsv(l.leadInfoApi)}","${escapeCsv(l.source)}","${escapeCsv(l.firstName)}","${escapeCsv(l.lastName)}","${escapeCsv(l.company)}","${escapeCsv(l.email)}","${escapeCsv(l.phone)}","${escapeCsv(l.matchType)}"\n`;
+      csv += `"G${i+1}","${getTierLabel(g.matchTier)}","${g.occurrenceCount}","${g.sourceCount || ''}","${g.isCrossBatch ? 'Yes' : 'No'}","${l.displayDate || ''}","${escapeCsv(l.batchName)}","${escapeCsv(l.batchLeadInfoApi)}","${escapeCsv(l.leadInfoApi)}","${escapeCsv(l.source)}","${escapeCsv(l.firstName)}","${escapeCsv(l.lastName)}","${escapeCsv(l.company)}","${escapeCsv(l.email)}","${escapeCsv(l.phone)}","${escapeCsv(l.matchType)}"\n`;
     });
     csv += '\n';
   });
@@ -856,7 +933,7 @@ function exportDuplicates(scope) {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 100);
-  showStatus(`✓ Exported: ${filename}.csv (${groups.length} groups)`, 'success');
+  showStatus(`Exported: ${filename}.csv (${groups.length} groups)`, 'success');
 }
 
 // ============================================================
@@ -869,8 +946,8 @@ function exportDuplicates(scope) {
     const banner = document.getElementById('configBanner');
     banner.classList.remove('hidden');
     banner.classList.add('connected');
-    banner.innerHTML = `✓ Connected to <b>${API_BASE}</b>`;
-    showStatus(`✓ Database loaded: <b>${cachedStats.total_leads.toLocaleString()}</b> leads across <b>${cachedStats.total_batches}</b> batches.`, 'success');
+    banner.innerHTML = `Connected to <b>${API_BASE}</b>`;
+    showStatus(`Database loaded: <b>${cachedStats.total_leads.toLocaleString()}</b> leads across <b>${cachedStats.total_batches}</b> batches.`, 'success');
   } catch (err) {
     // refreshAll already shows the error
   }

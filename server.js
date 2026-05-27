@@ -1,15 +1,17 @@
 require('dotenv').config();
 // ============================================================
-// PMF Lead Database — Backend API (v6: strong/weak edge dedup)
+// PMF Lead Database — Backend API (v7: tier-based dedup)
 // Node.js + Express + PostgreSQL
 //
-// CHANGES from v5:
-//   - Email-shared and phone-shared records no longer union by default.
-//     They now require name match AND company similarity ≥85% (strong),
-//     OR they become a "weak pair" that doesn't chain transitively.
-//   - Different-name records sharing only an email or phone are no longer
-//     linked at all (was the source of cross-business chaining).
-//   - Each emitted group has matchStrength: 'strong' | 'weak'.
+// CHANGES from v6:
+//   - Match results classified into 4 tiers: exact | strong | probable | fuzzy.
+//     * exact:    all four fields (name/email/phone/company) byte-identical
+//     * strong:   v6's "strong" groups (name+contact+company≥85%)
+//     * probable: v6's "weak" pairs (name+contact, companies differ/blank)
+//     * fuzzy:    name+company 75–84% similar OR same-company different-names
+//   - Added company signal-group processing for "different contacts at same business"
+//   - Added PATCH /api/batches/:id for inline batch renaming
+//   - Removed the priority field on emitted groups (frontend no longer uses it)
 // ============================================================
 
 const express = require('express');
@@ -95,6 +97,10 @@ function normalizePhone(phone) {
   return String(phone).replace(/\D/g, '');
 }
 
+function normalizeCompany(c) {
+  return (c || '').toLowerCase().trim();
+}
+
 function stringSimilarity(s1, s2) {
   if (!s1 || !s2) return 0;
   s1 = s1.toLowerCase().trim();
@@ -102,9 +108,8 @@ function stringSimilarity(s1, s2) {
   if (s1 === s2) return 1;
   const maxLen = Math.max(s1.length, s2.length);
   if (maxLen === 0) return 0;
-  // Fast-reject: edit distance >= |len(s1) - len(s2)|, so similarity cannot
-  // exceed 1 - lenDiff/maxLen. We only ever call with threshold >= 0.85, so a
-  // length gap above 50% guarantees rejection without running Levenshtein.
+  // Fast-reject: edit distance >= |len(s1) - len(s2)|; if the length gap alone
+  // pushes max similarity below 50%, no chance of clearing any threshold we use (≥75%).
   if (Math.abs(s1.length - s2.length) > maxLen * 0.5) return 0;
   const m = [];
   for (let i = 0; i <= s2.length; i++) m[i] = [i];
@@ -119,26 +124,57 @@ function stringSimilarity(s1, s2) {
   return 1 - (m[s2.length][s1.length] / Math.max(s1.length, s2.length));
 }
 
-function getPriorityLevel(days) {
-  if (days <= 30) return 'critical';
-  if (days <= 60) return 'high';
-  if (days <= 90) return 'medium';
-  if (days <= 365) return 'regular';
-  return 'none';
+// Thresholds
+const COMPANY_SIM_STRONG = 0.85;        // strong tier requires this
+const COMPANY_SIM_FUZZY  = 0.75;        // fuzzy tier accepts down to this
+const MIN_COMPANY_LEN_FOR_FUZZY = 5;    // skip super-short company strings for fuzzy
+const MAX_SIGNAL_GROUP_SIZE = 100;      // skip pathological email/phone/name groups
+const MAX_COMPANY_GROUP_SIZE = 50;      // tighter cap for company groups (more noise)
+
+function companiesStrong(c1, c2) {
+  if (!c1 || !c2) return false;
+  return stringSimilarity(c1, c2) >= COMPANY_SIM_STRONG;
 }
 
-// Strict company-match gate: both sides must be present, and similar enough.
-const COMPANY_SIM_THRESHOLD = 0.85;
-function companiesMatch(c1, c2) {
-  if (!c1 || !c2) return false; // blank treated as "not enough info to match"
-  return stringSimilarity(c1, c2) >= COMPANY_SIM_THRESHOLD;
+// Tier classifier — applied at emit time once full lead data is available.
+function classifyTier(leads, source) {
+  if (source === 'weak-pair') return 'probable';
+  if (source === 'fuzzy-pair' || source === 'fuzzy-cluster') return 'fuzzy';
+  // source === 'strong-group' — could be exact or strong
+  const f = leads[0];
+  const refName = f.fullName || '';
+  const refEmail = f.email || '';
+  const refPhone = f.normalizedPhone || '';
+  const refCompany = normalizeCompany(f.company);
+  for (let i = 1; i < leads.length; i++) {
+    const l = leads[i];
+    if ((l.fullName || '') !== refName) return 'strong';
+    if ((l.email || '') !== refEmail) return 'strong';
+    if ((l.normalizedPhone || '') !== refPhone) return 'strong';
+    if (normalizeCompany(l.company) !== refCompany) return 'strong';
+  }
+  return 'exact';
 }
 
-// determineMatchType — runs after groups are formed, picks the badge for each lead.
-// For weak pair groups (size 2, contact-only match), labels are tagged "(unverified)"
-// so the UI can distinguish them from strong groups where company was verified.
-function determineMatchType(lead, group, isWeakPair) {
-  if (isWeakPair) {
+// determineMatchType — per-lead badge. Tier-aware so weak/fuzzy pairs are tagged clearly.
+function determineMatchType(lead, group, source) {
+  if (source === 'fuzzy-cluster') {
+    return 'Same Company';
+  }
+  if (source === 'fuzzy-pair') {
+    // Name match + company 75-84% similar
+    for (const o of group) {
+      if (o === lead) continue;
+      if (lead.fullName && lead.fullName === o.fullName && lead.company && o.company) {
+        const sim = stringSimilarity(lead.company, o.company);
+        if (sim >= COMPANY_SIM_FUZZY && sim < COMPANY_SIM_STRONG) {
+          return `Name + Company (${Math.round(sim*100)}%)`;
+        }
+      }
+    }
+    return 'Fuzzy match';
+  }
+  if (source === 'weak-pair') {
     for (const o of group) {
       if (o === lead) continue;
       if (lead.fullName && lead.fullName === o.fullName
@@ -155,13 +191,12 @@ function determineMatchType(lead, group, isWeakPair) {
     }
     return 'Weak match';
   }
-
-  // Strong group — every union had companies ≥85% similar.
+  // source === 'strong-group'
   for (const o of group) {
     if (o === lead) continue;
     if (lead.fullName && lead.fullName === o.fullName
         && lead.email && lead.email === o.email
-        && companiesMatch(lead.company, o.company)) {
+        && companiesStrong(lead.company, o.company)) {
       return 'Name + Email';
     }
   }
@@ -169,7 +204,7 @@ function determineMatchType(lead, group, isWeakPair) {
     if (o === lead) continue;
     if (lead.fullName && lead.fullName === o.fullName
         && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone
-        && companiesMatch(lead.company, o.company)) {
+        && companiesStrong(lead.company, o.company)) {
       return 'Name + Phone';
     }
   }
@@ -177,22 +212,21 @@ function determineMatchType(lead, group, isWeakPair) {
     if (o === lead) continue;
     if (lead.fullName && lead.fullName === o.fullName && lead.company && o.company) {
       const sim = stringSimilarity(lead.company, o.company);
-      if (sim >= COMPANY_SIM_THRESHOLD) return `Name + Company (${Math.round(sim*100)}%)`;
+      if (sim >= COMPANY_SIM_STRONG) return `Name + Company (${Math.round(sim*100)}%)`;
     }
   }
   return 'Linked via chain';
 }
 
 // ============================================================
-// DEDUP — strong/weak edges, typed arrays, batched streaming
+// DEDUP — tier-based emission
 // ============================================================
 async function computeDuplicatesStreaming(client, emit) {
   console.log('[dedup] starting');
   const t0 = Date.now();
-  const MAX_GROUP_SIZE = 100; // skip pathological signal groups (e.g. info@gmail.com)
 
-  // ----- Step 1: Get signal groups (ID arrays only) -----
-  const [emailGroups, phoneGroups, nameGroups] = await Promise.all([
+  // ----- Step 1: Get all four signal groups -----
+  const [emailGroups, phoneGroups, nameGroups, companyGroups] = await Promise.all([
     client.query(`
       SELECT array_agg(id ORDER BY id) AS lead_ids
       FROM leads WHERE email <> ''
@@ -207,32 +241,39 @@ async function computeDuplicatesStreaming(client, emit) {
       SELECT array_agg(id ORDER BY id) AS lead_ids
       FROM leads WHERE full_name <> ''
       GROUP BY full_name HAVING COUNT(*) > 1
+    `),
+    client.query(`
+      SELECT array_agg(id ORDER BY id) AS lead_ids
+      FROM leads
+      WHERE company <> '' AND LENGTH(TRIM(company)) >= ${MIN_COMPANY_LEN_FOR_FUZZY}
+      GROUP BY LOWER(TRIM(company)) HAVING COUNT(*) > 1
     `)
   ]);
 
-  const filterGroups = (rows) => {
+  const filterGroups = (rows, cap) => {
     const out = [];
     for (const row of rows) {
-      if (row.lead_ids.length >= 2 && row.lead_ids.length <= MAX_GROUP_SIZE) {
-        out.push(row.lead_ids);
-      }
+      if (row.lead_ids.length >= 2 && row.lead_ids.length <= cap) out.push(row.lead_ids);
     }
     return out;
   };
-  const emailArrays = filterGroups(emailGroups.rows);
-  const phoneArrays = filterGroups(phoneGroups.rows);
-  const nameArrays = filterGroups(nameGroups.rows);
+  const emailArrays   = filterGroups(emailGroups.rows,   MAX_SIGNAL_GROUP_SIZE);
+  const phoneArrays   = filterGroups(phoneGroups.rows,   MAX_SIGNAL_GROUP_SIZE);
+  const nameArrays    = filterGroups(nameGroups.rows,    MAX_SIGNAL_GROUP_SIZE);
+  const companyArrays = filterGroups(companyGroups.rows, MAX_COMPANY_GROUP_SIZE);
   emailGroups.rows.length = 0;
   phoneGroups.rows.length = 0;
   nameGroups.rows.length = 0;
+  companyGroups.rows.length = 0;
 
-  console.log(`[dedup] signals: ${emailArrays.length} email / ${phoneArrays.length} phone / ${nameArrays.length} name (${Date.now() - t0}ms)`);
+  console.log(`[dedup] signals: ${emailArrays.length} email / ${phoneArrays.length} phone / ${nameArrays.length} name / ${companyArrays.length} company (${Date.now() - t0}ms)`);
 
   // ----- Step 2: Collect all candidate IDs -----
   const allCandidateIds = new Set();
-  for (const arr of emailArrays) for (const id of arr) allCandidateIds.add(id);
-  for (const arr of phoneArrays) for (const id of arr) allCandidateIds.add(id);
-  for (const arr of nameArrays) for (const id of arr) allCandidateIds.add(id);
+  for (const arr of emailArrays)   for (const id of arr) allCandidateIds.add(id);
+  for (const arr of phoneArrays)   for (const id of arr) allCandidateIds.add(id);
+  for (const arr of nameArrays)    for (const id of arr) allCandidateIds.add(id);
+  for (const arr of companyArrays) for (const id of arr) allCandidateIds.add(id);
 
   if (allCandidateIds.size === 0) {
     console.log('[dedup] no candidates');
@@ -240,7 +281,6 @@ async function computeDuplicatesStreaming(client, emit) {
   }
 
   // ----- Step 3: Fetch (name, company) for all candidates -----
-  // We need both to pairwise verify matches inside each signal group.
   const meta = new Map();
   const candidateIdArr = Array.from(allCandidateIds);
   allCandidateIds.clear();
@@ -262,7 +302,7 @@ async function computeDuplicatesStreaming(client, emit) {
   const N = candidateIdArr.length;
   const idToIdx = new Map();
   for (let i = 0; i < N; i++) idToIdx.set(candidateIdArr[i], i);
-  const idxToId = candidateIdArr; // alias — same array
+  const idxToId = candidateIdArr;
 
   const parent = new Int32Array(N);
   const rankArr = new Int8Array(N);
@@ -287,21 +327,28 @@ async function computeDuplicatesStreaming(client, emit) {
     else { parent[rb] = ra; rankArr[ra]++; }
   }
 
-  // Weak pair store. Keyed by "minId-maxId" to dedupe across signal groups.
-  // These will NOT participate in union-find — they're emitted as standalone pair groups.
-  const weakPairs = new Map(); // key -> [minId, maxId, signal]
+  // Pair stores — keyed by "minId-maxId" to dedupe across signal groups.
+  const weakPairs = new Map();  // Tier 3 candidates (name+contact, company unverified)
+  const fuzzyPairs = new Map(); // Tier 4 candidates (name + 75-84% company)
+
+  function pairKey(idA, idB) {
+    return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
+  }
   function addWeakPair(idA, idB, signal) {
-    const min = idA < idB ? idA : idB;
-    const max = idA < idB ? idB : idA;
-    const k = `${min}-${max}`;
+    const k = pairKey(idA, idB);
     if (weakPairs.has(k)) return;
-    weakPairs.set(k, [min, max, signal]);
+    weakPairs.set(k, [Math.min(idA, idB), Math.max(idA, idB), signal]);
+  }
+  function addFuzzyPair(idA, idB, signal) {
+    const k = pairKey(idA, idB);
+    if (weakPairs.has(k) || fuzzyPairs.has(k)) return;
+    fuzzyPairs.set(k, [Math.min(idA, idB), Math.max(idA, idB), signal]);
   }
 
-  // ----- Step 5: Process email signal groups -----
-  // Rule: same email + same name + companies match ≥85%  →  STRONG (union)
-  //       same email + same name + companies differ/blank →  WEAK PAIR
-  //       same email + different name                     →  NO EDGE (was the bridge bug)
+  // ----- Step 5: Email signal groups -----
+  // same email + same name + companies≥85% → STRONG
+  // same email + same name + companies differ/blank → PROBABLE
+  // same email + different name → NO EDGE
   for (const arr of emailArrays) {
     for (let i = 0; i < arr.length - 1; i++) {
       const a = meta.get(arr[i]);
@@ -310,7 +357,7 @@ async function computeDuplicatesStreaming(client, emit) {
         const b = meta.get(arr[j]);
         if (!b || !b.name) continue;
         if (a.name !== b.name) continue;
-        if (companiesMatch(a.company, b.company)) {
+        if (companiesStrong(a.company, b.company)) {
           union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
         } else {
           addWeakPair(arr[i], arr[j], 'email');
@@ -320,7 +367,7 @@ async function computeDuplicatesStreaming(client, emit) {
   }
   emailArrays.length = 0;
 
-  // ----- Step 6: Process phone signal groups (same rules) -----
+  // ----- Step 6: Phone signal groups (same rules) -----
   for (const arr of phoneArrays) {
     for (let i = 0; i < arr.length - 1; i++) {
       const a = meta.get(arr[i]);
@@ -329,7 +376,7 @@ async function computeDuplicatesStreaming(client, emit) {
         const b = meta.get(arr[j]);
         if (!b || !b.name) continue;
         if (a.name !== b.name) continue;
-        if (companiesMatch(a.company, b.company)) {
+        if (companiesStrong(a.company, b.company)) {
           union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
         } else {
           addWeakPair(arr[i], arr[j], 'phone');
@@ -339,26 +386,54 @@ async function computeDuplicatesStreaming(client, emit) {
   }
   phoneArrays.length = 0;
 
-  // ----- Step 7: Process name signal groups (Name + Company≥85%) -----
-  // Unchanged from v5. This rule already required company similarity, so it stays strong.
+  // ----- Step 7: Name signal groups -----
+  // companies ≥85% → STRONG
+  // companies 75-84% → FUZZY pair (NEW in v7)
   for (const arr of nameArrays) {
     for (let i = 0; i < arr.length - 1; i++) {
       const a = meta.get(arr[i]);
-      if (!a || !a.company) continue;
+      if (!a || !a.company || a.company.length < MIN_COMPANY_LEN_FOR_FUZZY) continue;
       for (let j = i + 1; j < arr.length; j++) {
         const b = meta.get(arr[j]);
-        if (!b || !b.company) continue;
-        if (companiesMatch(a.company, b.company)) {
+        if (!b || !b.company || b.company.length < MIN_COMPANY_LEN_FOR_FUZZY) continue;
+        const sim = stringSimilarity(a.company, b.company);
+        if (sim >= COMPANY_SIM_STRONG) {
           union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
+        } else if (sim >= COMPANY_SIM_FUZZY) {
+          addFuzzyPair(arr[i], arr[j], 'name+company-fuzzy');
         }
       }
     }
   }
   nameArrays.length = 0;
 
-  console.log(`[dedup] union-find done, ${weakPairs.size} candidate weak pairs (${Date.now() - t0}ms)`);
+  console.log(`[dedup] union-find done, ${weakPairs.size} probable, ${fuzzyPairs.size} fuzzy-pair (${Date.now() - t0}ms)`);
 
-  // ----- Step 8: Collect strong groups (size ≥ 2) -----
+  // ----- Step 8: Company signal groups → fuzzy CLUSTERS (NEW in v7) -----
+  // "Same business, different contacts." For each company group, pick one representative
+  // per (strong-component-root, name) combo. Emit only if ≥2 distinct names remain.
+  const fuzzyClusters = []; // arrays of representative IDs
+  for (const arr of companyArrays) {
+    const seen = new Map(); // "root|name" -> first id
+    const distinctNames = new Set();
+    for (const id of arr) {
+      const m = meta.get(id);
+      if (!m || !m.name) continue;
+      const root = find(idToIdx.get(id));
+      const key = `${root}|${m.name}`;
+      if (!seen.has(key)) {
+        seen.set(key, id);
+        distinctNames.add(m.name);
+      }
+    }
+    if (distinctNames.size >= 2) {
+      fuzzyClusters.push(Array.from(seen.values()));
+    }
+  }
+  companyArrays.length = 0;
+  console.log(`[dedup] ${fuzzyClusters.length} fuzzy clusters (${Date.now() - t0}ms)`);
+
+  // ----- Step 9: Collect strong groups -----
   const rootToGroup = new Map();
   for (let i = 0; i < N; i++) {
     const r = find(i);
@@ -371,9 +446,7 @@ async function computeDuplicatesStreaming(client, emit) {
   }
   rootToGroup.clear();
 
-  // ----- Step 9: Filter weak pairs — drop ones already inside a strong group -----
-  // If both members of a weak pair landed in the same strong component (via some
-  // other path), the pair is redundant — they're already shown together.
+  // ----- Step 10: Filter pairs — drop those already inside a strong group -----
   const weakPairList = [];
   for (const [, pair] of weakPairs) {
     const ra = find(idToIdx.get(pair[0]));
@@ -383,29 +456,40 @@ async function computeDuplicatesStreaming(client, emit) {
   }
   weakPairs.clear();
 
-  console.log(`[dedup] ${strongGroups.length} strong groups, ${weakPairList.length} weak pair groups`);
+  const fuzzyPairList = [];
+  for (const [, pair] of fuzzyPairs) {
+    const ra = find(idToIdx.get(pair[0]));
+    const rb = find(idToIdx.get(pair[1]));
+    if (ra === rb) continue;
+    fuzzyPairList.push(pair);
+  }
+  fuzzyPairs.clear();
+
+  console.log(`[dedup] final: ${strongGroups.length} strong, ${weakPairList.length} probable, ${fuzzyPairList.length} fuzzy-pair, ${fuzzyClusters.length} fuzzy-cluster`);
 
   meta.clear();
   idToIdx.clear();
 
-  if (strongGroups.length === 0 && weakPairList.length === 0) return 0;
+  const totalGroups = strongGroups.length + weakPairList.length + fuzzyPairList.length + fuzzyClusters.length;
+  if (totalGroups === 0) return 0;
 
-  // ----- Step 10: Combined emit list (strong groups + weak pairs) -----
-  const allGroupsToEmit = [];
-  for (const ids of strongGroups) allGroupsToEmit.push({ type: 'strong', ids });
-  for (const pair of weakPairList) {
-    allGroupsToEmit.push({ type: 'weak', ids: [pair[0], pair[1]], weakSignal: pair[2] });
-  }
+  // ----- Step 11: Build emission queue -----
+  const queue = [];
+  for (const ids of strongGroups)   queue.push({ source: 'strong-group',  ids });
+  for (const p of weakPairList)     queue.push({ source: 'weak-pair',     ids: [p[0], p[1]], signal: p[2] });
+  for (const p of fuzzyPairList)    queue.push({ source: 'fuzzy-pair',    ids: [p[0], p[1]], signal: p[2] });
+  for (const ids of fuzzyClusters)  queue.push({ source: 'fuzzy-cluster', ids, signal: 'same-company' });
   strongGroups.length = 0;
   weakPairList.length = 0;
+  fuzzyPairList.length = 0;
+  fuzzyClusters.length = 0;
 
-  // ----- Step 11: Fetch full lead data + emit in batches -----
-  const priOrder = ['critical', 'high', 'medium', 'regular', 'none'];
+  // ----- Step 12: Fetch full lead data and emit in batches -----
   const GROUPS_PER_BATCH = 100;
   let emitted = 0;
 
-  for (let b = 0; b < allGroupsToEmit.length; b += GROUPS_PER_BATCH) {
-    const batch = allGroupsToEmit.slice(b, b + GROUPS_PER_BATCH);
+  for (let b = 0; b < queue.length; b += GROUPS_PER_BATCH) {
+    const batch = queue.slice(b, b + GROUPS_PER_BATCH);
     const allIds = [];
     for (const g of batch) for (const id of g.ids) allIds.push(id);
 
@@ -451,37 +535,30 @@ async function computeDuplicatesStreaming(client, emit) {
       if (gl.length < 2) continue;
       gl.sort((a, c) => new Date(a.dateStr) - new Date(c.dateStr));
 
-      const isWeak = g.type === 'weak';
       gl[0].matchType = 'Original';
       for (let i = 1; i < gl.length; i++) {
-        gl[i].matchType = determineMatchType(gl[i], gl, isWeak);
+        gl[i].matchType = determineMatchType(gl[i], gl, g.source);
       }
 
-      let priority = 'none';
-      for (let i = 0; i < gl.length - 1; i++) {
-        for (let j = i + 1; j < gl.length; j++) {
-          const days = (new Date(gl[j].dateStr) - new Date(gl[i].dateStr)) / 86400000;
-          const p = getPriorityLevel(days);
-          if (priOrder.indexOf(p) < priOrder.indexOf(priority)) priority = p;
-        }
-      }
-
+      const matchTier = classifyTier(gl, g.source);
       const batchIds = new Set(gl.map(l => l.batchId));
+      const sources = new Set(gl.map(l => l.source).filter(Boolean));
+
       emit({
         leads: gl,
-        priority,
+        matchTier,                                  // 'exact' | 'strong' | 'probable' | 'fuzzy'
         isCrossBatch: batchIds.size > 1,
         batchCount: batchIds.size,
+        sourceCount: sources.size,
         occurrenceCount: gl.length,
-        matchStrength: isWeak ? 'weak' : 'strong',
-        weakSignal: g.weakSignal || null
+        signal: g.signal || null                    // 'email' | 'phone' | 'name+company-fuzzy' | 'same-company' | null
       });
       emitted++;
     }
     fullById.clear();
   }
 
-  allGroupsToEmit.length = 0;
+  queue.length = 0;
   console.log(`[dedup] emitted ${emitted} groups in ${Date.now() - t0}ms`);
   return emitted;
 }
@@ -515,6 +592,42 @@ app.get('/api/batches', requireAuth, async (req, res) => {
     `);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// NEW in v7: rename a batch's name and/or lead_info_api.
+app.patch('/api/batches/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: 'Invalid batch id' });
+
+    const updates = [];
+    const values = [];
+    let p = 1;
+    if (typeof req.body.name === 'string') {
+      const n = blank(req.body.name);
+      if (!n) return res.status(400).json({ error: 'Name cannot be blank' });
+      updates.push(`name = $${p++}`);
+      values.push(n);
+    }
+    if (typeof req.body.lead_info_api === 'string') {
+      updates.push(`lead_info_api = $${p++}`);
+      values.push(blank(req.body.lead_info_api));
+    }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No updatable fields provided' });
+    }
+    values.push(id);
+
+    const r = await pool.query(
+      `UPDATE batches SET ${updates.join(', ')} WHERE id = $${p} RETURNING id, name, lead_info_api, uploaded_at, lead_count`,
+      values
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Batch not found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[PATCH /api/batches/:id]', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete('/api/batches/:id', requireAuth, async (req, res) => {
