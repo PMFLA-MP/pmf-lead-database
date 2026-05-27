@@ -304,6 +304,7 @@
         </div>
 
         <div class="export-buttons mb-2">
+          <button class="btn btn-small" style="background:#0176D3;" onclick="exportClean()">Clean for Salesforce</button>
           <button class="btn btn-small btn-green" onclick="exportDuplicates('all')">Export All</button>
           <button class="btn btn-small" style="background:#10b981;" onclick="exportDuplicates('exact')">Exact</button>
           <button class="btn btn-small" style="background:#3b82f6;" onclick="exportDuplicates('strong')">Strong</button>
@@ -901,6 +902,33 @@ async function confirmClearDb() {
 // ============================================================
 // EXPORTS
 // ============================================================
+async function exportClean() {
+  showStatus('Building clean export… this may take a minute for large databases.', 'info');
+  try {
+    const res = await fetch(API_BASE + '/api/export/clean', {
+      headers: { 'x-auth-token': AUTH_TOKEN }
+    });
+    if (!res.ok) {
+      let errMsg = `${res.status} ${res.statusText}`;
+      try { const j = await res.json(); if (j.error) errMsg = j.error; } catch (_) {}
+      throw new Error(errMsg);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'leads_clean_for_salesforce.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+    const kb = Math.round(blob.size / 1024);
+    showStatus(`Clean export downloaded (${kb.toLocaleString()} KB). Ready to upload to Salesforce.`, 'success');
+  } catch (err) {
+    showStatus(`Clean export failed: ${escapeHtml(err.message)}`, 'error');
+  }
+}
+
 function exportDuplicates(scope) {
   let groups = cachedGroups;
   let filename = 'duplicates_all';

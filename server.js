@@ -733,6 +733,231 @@ app.get('/api/duplicates', requireAuth, async (req, res) => {
   }
 });
 
+// ============================================================
+// CLEAN EXPORT — one CSV ready for Salesforce upload
+// ============================================================
+// Rules:
+//   Exact + Strong groups → merge to one row:
+//     - name fields: from the oldest record (they match by definition)
+//     - email + phone: most recent non-blank value
+//     - company: longest version (usually the most complete)
+//     - date received: earliest
+//     - source + lead_info_api: unique values joined with ' | '
+//   Probable + Fuzzy-pair groups → keep one row, the winner by most-non-blank-fields
+//   Fuzzy-cluster groups → keep ALL rows (these are co-workers at the same business,
+//     not duplicates of each other); each gets a "Co-worker at: X" note
+//   Leads in no group → pass through as Unique
+// ============================================================
+
+function csvField(s) {
+  if (s == null) return '';
+  const str = String(s);
+  if (str.indexOf('"') >= 0 || str.indexOf(',') >= 0 || str.indexOf('\n') >= 0 || str.indexOf('\r') >= 0) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  return str;
+}
+
+function csvLine(fields) {
+  return fields.map(csvField).join(',') + '\r\n';
+}
+
+const CLEAN_HEADER = csvLine([
+  'First Name', 'Last Name', 'Company', 'Email', 'Phone',
+  'Lead Source', 'Lead Info API', 'Date Received',
+  'Match Quality', 'Duplicate Count', 'Notes'
+]);
+
+function dateMs(l) {
+  return l.dateStr ? new Date(l.dateStr).getTime() : 0;
+}
+
+function mergeRow(leads, quality) {
+  const oldest = [...leads].sort((a, b) => dateMs(a) - dateMs(b))[0];
+  const newestFirst = [...leads].sort((a, b) => dateMs(b) - dateMs(a));
+
+  const mostRecentNonBlank = (field) => {
+    for (const l of newestFirst) {
+      const v = (l[field] || '').toString().trim();
+      if (v) return v;
+    }
+    return '';
+  };
+  const longest = (field) => {
+    let best = '';
+    for (const l of leads) {
+      const v = (l[field] || '').toString().trim();
+      if (v.length > best.length) best = v;
+    }
+    return best;
+  };
+  const uniqueConcat = (field) => {
+    const seen = new Set();
+    const out = [];
+    for (const l of leads) {
+      const v = (l[field] || '').toString().trim();
+      if (v && !seen.has(v.toLowerCase())) {
+        seen.add(v.toLowerCase());
+        out.push(v);
+      }
+    }
+    return out.join(' | ');
+  };
+
+  return [
+    oldest.firstName || '',
+    oldest.lastName || '',
+    longest('company'),
+    mostRecentNonBlank('email'),
+    mostRecentNonBlank('phone'),
+    uniqueConcat('source'),
+    uniqueConcat('batchLeadInfoApi'),
+    oldest.displayDate || '',
+    quality,
+    leads.length,
+    ''
+  ];
+}
+
+function winnerRow(leads, quality) {
+  const score = (l) => {
+    let s = 0;
+    if ((l.firstName || '').toString().trim()) s++;
+    if ((l.lastName  || '').toString().trim()) s++;
+    if ((l.email     || '').toString().trim()) s++;
+    if ((l.phone     || '').toString().trim()) s++;
+    if ((l.company   || '').toString().trim()) s++;
+    if ((l.source    || '').toString().trim()) s++;
+    return s;
+  };
+  const sorted = [...leads].sort((a, b) => {
+    const ds = score(b) - score(a);
+    if (ds !== 0) return ds;
+    return dateMs(a) - dateMs(b); // older wins ties (preserves first-seen date)
+  });
+  const w = sorted[0];
+  return [
+    w.firstName || '',
+    w.lastName || '',
+    w.company || '',
+    w.email || '',
+    w.phone || '',
+    w.source || '',
+    w.batchLeadInfoApi || '',
+    w.displayDate || '',
+    quality,
+    leads.length,
+    ''
+  ];
+}
+
+function passThroughRow(l, quality, notes) {
+  return [
+    l.firstName || '',
+    l.lastName || '',
+    l.company || '',
+    l.email || '',
+    l.phone || '',
+    l.source || '',
+    l.batchLeadInfoApi || '',
+    l.displayDate || '',
+    quality,
+    1,
+    notes || ''
+  ];
+}
+
+app.get('/api/export/clean', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  let headersSent = false;
+  const memberIds = new Set();
+  let groupsWritten = 0;
+  let uniquesWritten = 0;
+
+  try {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="leads_clean_for_salesforce.csv"');
+    res.setHeader('Cache-Control', 'no-store');
+    res.write('\uFEFF');      // BOM for Excel
+    res.write(CLEAN_HEADER);
+    headersSent = true;
+
+    // Step 1: run dedup, emit one row per group (or N rows for fuzzy-clusters)
+    await computeDuplicatesStreaming(client, (group) => {
+      for (const l of group.leads) memberIds.add(l.id);
+
+      if (group.matchTier === 'exact') {
+        res.write(csvLine(mergeRow(group.leads, 'Exact')));
+        groupsWritten++;
+      } else if (group.matchTier === 'strong') {
+        res.write(csvLine(mergeRow(group.leads, 'Strong')));
+        groupsWritten++;
+      } else if (group.matchTier === 'probable') {
+        res.write(csvLine(winnerRow(group.leads, 'Probable')));
+        groupsWritten++;
+      } else if (group.matchTier === 'fuzzy') {
+        if (group.signal === 'same-company') {
+          // Co-workers at the same business — keep every record
+          const company = group.leads[0].company || '';
+          for (const l of group.leads) {
+            res.write(csvLine(passThroughRow(l, 'Unique', `Co-worker at: ${company}`)));
+            groupsWritten++;
+          }
+        } else {
+          res.write(csvLine(winnerRow(group.leads, 'Fuzzy')));
+          groupsWritten++;
+        }
+      }
+    });
+
+    console.log(`[clean-export] ${groupsWritten} rows from groups, ${memberIds.size} member ids tracked`);
+
+    // Step 2: stream all leads NOT in any duplicate group as Unique
+    let lastId = 0;
+    const CHUNK = 5000;
+    while (true) {
+      const r = await client.query(`
+        SELECT l.id, b.lead_info_api AS batch_lead_info_api,
+               l.date_received, l.source, l.first_name, l.last_name,
+               l.email, l.phone, l.company
+        FROM leads l JOIN batches b ON b.id = l.batch_id
+        WHERE l.id > $1 ORDER BY l.id LIMIT $2
+      `, [lastId, CHUNK]);
+      if (r.rows.length === 0) break;
+      for (const row of r.rows) {
+        lastId = row.id;
+        if (memberIds.has(row.id)) continue;
+        const lead = {
+          firstName: row.first_name,
+          lastName: row.last_name,
+          company: row.company,
+          email: row.email,
+          phone: row.phone,
+          source: row.source,
+          batchLeadInfoApi: row.batch_lead_info_api,
+          displayDate: row.date_received ? new Date(row.date_received).toLocaleDateString() : ''
+        };
+        res.write(csvLine(passThroughRow(lead, 'Unique', '')));
+        uniquesWritten++;
+      }
+      r.rows.length = 0;
+    }
+
+    console.log(`[clean-export] total: ${groupsWritten} group rows + ${uniquesWritten} unique rows = ${groupsWritten + uniquesWritten}`);
+    res.end();
+  } catch (e) {
+    console.error('[GET /api/export/clean]', e);
+    if (!headersSent) {
+      res.status(500).json({ error: e.message });
+    } else {
+      try { res.write(`\r\n# ERROR mid-stream: ${e.message}\r\n`); } catch (_) {}
+      res.end();
+    }
+  } finally {
+    client.release();
+  }
+});
+
 initDb()
   .then(() => app.listen(PORT, () => console.log(`[ready] server on port ${PORT}`)))
   .catch(err => { console.error('[fatal] DB init failed:', err); process.exit(1); });
