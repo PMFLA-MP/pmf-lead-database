@@ -1,7 +1,15 @@
 require('dotenv').config();
 // ============================================================
-// PMF Lead Database — Backend API (v5: typed arrays + batched streaming)
+// PMF Lead Database — Backend API (v6: strong/weak edge dedup)
 // Node.js + Express + PostgreSQL
+//
+// CHANGES from v5:
+//   - Email-shared and phone-shared records no longer union by default.
+//     They now require name match AND company similarity ≥85% (strong),
+//     OR they become a "weak pair" that doesn't chain transitively.
+//   - Different-name records sharing only an email or phone are no longer
+//     linked at all (was the source of cross-business chaining).
+//   - Each emitted group has matchStrength: 'strong' | 'weak'.
 // ============================================================
 
 const express = require('express');
@@ -92,6 +100,12 @@ function stringSimilarity(s1, s2) {
   s1 = s1.toLowerCase().trim();
   s2 = s2.toLowerCase().trim();
   if (s1 === s2) return 1;
+  const maxLen = Math.max(s1.length, s2.length);
+  if (maxLen === 0) return 0;
+  // Fast-reject: edit distance >= |len(s1) - len(s2)|, so similarity cannot
+  // exceed 1 - lenDiff/maxLen. We only ever call with threshold >= 0.85, so a
+  // length gap above 50% guarantees rejection without running Levenshtein.
+  if (Math.abs(s1.length - s2.length) > maxLen * 0.5) return 0;
   const m = [];
   for (let i = 0; i <= s2.length; i++) m[i] = [i];
   for (let j = 0; j <= s1.length; j++) m[0][j] = j;
@@ -113,58 +127,71 @@ function getPriorityLevel(days) {
   return 'none';
 }
 
-function determineMatchType(lead, group) {
+// Strict company-match gate: both sides must be present, and similar enough.
+const COMPANY_SIM_THRESHOLD = 0.85;
+function companiesMatch(c1, c2) {
+  if (!c1 || !c2) return false; // blank treated as "not enough info to match"
+  return stringSimilarity(c1, c2) >= COMPANY_SIM_THRESHOLD;
+}
+
+// determineMatchType — runs after groups are formed, picks the badge for each lead.
+// For weak pair groups (size 2, contact-only match), labels are tagged "(unverified)"
+// so the UI can distinguish them from strong groups where company was verified.
+function determineMatchType(lead, group, isWeakPair) {
+  if (isWeakPair) {
+    for (const o of group) {
+      if (o === lead) continue;
+      if (lead.fullName && lead.fullName === o.fullName
+          && lead.email && lead.email === o.email) {
+        return 'Name + Email (unverified)';
+      }
+    }
+    for (const o of group) {
+      if (o === lead) continue;
+      if (lead.fullName && lead.fullName === o.fullName
+          && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) {
+        return 'Name + Phone (unverified)';
+      }
+    }
+    return 'Weak match';
+  }
+
+  // Strong group — every union had companies ≥85% similar.
   for (const o of group) {
     if (o === lead) continue;
-    if (lead.fullName && lead.fullName === o.fullName && lead.email && lead.email === o.email) return 'Name + Email';
+    if (lead.fullName && lead.fullName === o.fullName
+        && lead.email && lead.email === o.email
+        && companiesMatch(lead.company, o.company)) {
+      return 'Name + Email';
+    }
   }
   for (const o of group) {
     if (o === lead) continue;
-    if (lead.fullName && lead.fullName === o.fullName && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Name + Phone';
+    if (lead.fullName && lead.fullName === o.fullName
+        && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone
+        && companiesMatch(lead.company, o.company)) {
+      return 'Name + Phone';
+    }
   }
   for (const o of group) {
     if (o === lead) continue;
     if (lead.fullName && lead.fullName === o.fullName && lead.company && o.company) {
       const sim = stringSimilarity(lead.company, o.company);
-      if (sim >= 0.85) return `Name + Company (${Math.round(sim*100)}%)`;
+      if (sim >= COMPANY_SIM_THRESHOLD) return `Name + Company (${Math.round(sim*100)}%)`;
     }
-  }
-  for (const o of group) {
-    if (o === lead) continue;
-    if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
-        && lead.email && lead.email === o.email) return 'Company + Email';
-  }
-  for (const o of group) {
-    if (o === lead) continue;
-    if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
-        && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Company + Phone';
-  }
-  for (const o of group) {
-    if (o === lead) continue;
-    if (lead.email && lead.email === o.email) return 'Email only';
-  }
-  for (const o of group) {
-    if (o === lead) continue;
-    if (lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Phone only';
   }
   return 'Linked via chain';
 }
 
 // ============================================================
-// DEDUP — typed arrays + batched fetching + streaming
-//
-// Designed to handle 500k+ candidate leads in <200MB RAM.
-// Key tricks:
-//   - Union-Find uses Int32Array (2MB for 500k IDs instead of 40MB+ Map)
-//   - Companies fetched only for small name groups (not all candidates)
-//   - Full lead data fetched lazily in batches of 100 groups at a time
-//   - Each batch emitted to the response stream then freed
+// DEDUP — strong/weak edges, typed arrays, batched streaming
 // ============================================================
 async function computeDuplicatesStreaming(client, emit) {
   console.log('[dedup] starting');
   const t0 = Date.now();
+  const MAX_GROUP_SIZE = 100; // skip pathological signal groups (e.g. info@gmail.com)
 
-  // ----- Step 1: Get signal groups (just ID arrays, no lead data) -----
+  // ----- Step 1: Get signal groups (ID arrays only) -----
   const [emailGroups, phoneGroups, nameGroups] = await Promise.all([
     client.query(`
       SELECT array_agg(id ORDER BY id) AS lead_ids
@@ -182,49 +209,63 @@ async function computeDuplicatesStreaming(client, emit) {
       GROUP BY full_name HAVING COUNT(*) > 1
     `)
   ]);
-  console.log(`[dedup] signals: ${emailGroups.rows.length} email / ${phoneGroups.rows.length} phone / ${nameGroups.rows.length} name (${Date.now() - t0}ms)`);
 
-  // Extract just the ID arrays — drop the row wrapper objects to save memory
-  const emailArrays = emailGroups.rows.map(r => r.lead_ids);
-  const phoneArrays = phoneGroups.rows.map(r => r.lead_ids);
-  // For names, filter to small groups only (skip pathologically common names)
-  const nameArrays = [];
-  for (const row of nameGroups.rows) {
-    if (row.lead_ids.length >= 2 && row.lead_ids.length <= 100) {
-      nameArrays.push(row.lead_ids);
+  const filterGroups = (rows) => {
+    const out = [];
+    for (const row of rows) {
+      if (row.lead_ids.length >= 2 && row.lead_ids.length <= MAX_GROUP_SIZE) {
+        out.push(row.lead_ids);
+      }
     }
-  }
-  // Free row wrappers
+    return out;
+  };
+  const emailArrays = filterGroups(emailGroups.rows);
+  const phoneArrays = filterGroups(phoneGroups.rows);
+  const nameArrays = filterGroups(nameGroups.rows);
   emailGroups.rows.length = 0;
   phoneGroups.rows.length = 0;
   nameGroups.rows.length = 0;
 
-  // ----- Step 2: Assign positions for typed-array union-find -----
-  const idToIdx = new Map();
-  const idxToId = [];
-  function getIdx(id) {
-    let idx = idToIdx.get(id);
-    if (idx === undefined) {
-      idx = idxToId.length;
-      idToIdx.set(id, idx);
-      idxToId.push(id);
-    }
-    return idx;
-  }
-  for (const arr of emailArrays) for (const id of arr) getIdx(id);
-  for (const arr of phoneArrays) for (const id of arr) getIdx(id);
-  for (const arr of nameArrays) for (const id of arr) getIdx(id);
+  console.log(`[dedup] signals: ${emailArrays.length} email / ${phoneArrays.length} phone / ${nameArrays.length} name (${Date.now() - t0}ms)`);
 
-  const N = idxToId.length;
-  if (N === 0) {
+  // ----- Step 2: Collect all candidate IDs -----
+  const allCandidateIds = new Set();
+  for (const arr of emailArrays) for (const id of arr) allCandidateIds.add(id);
+  for (const arr of phoneArrays) for (const id of arr) allCandidateIds.add(id);
+  for (const arr of nameArrays) for (const id of arr) allCandidateIds.add(id);
+
+  if (allCandidateIds.size === 0) {
     console.log('[dedup] no candidates');
     return 0;
   }
-  console.log(`[dedup] ${N} candidates`);
 
-  // ----- Step 3: Union-Find with typed arrays (compact memory) -----
+  // ----- Step 3: Fetch (name, company) for all candidates -----
+  // We need both to pairwise verify matches inside each signal group.
+  const meta = new Map();
+  const candidateIdArr = Array.from(allCandidateIds);
+  allCandidateIds.clear();
+  const FETCH_CHUNK = 5000;
+  for (let i = 0; i < candidateIdArr.length; i += FETCH_CHUNK) {
+    const slice = candidateIdArr.slice(i, i + FETCH_CHUNK);
+    const r = await client.query(
+      `SELECT id, full_name, company FROM leads WHERE id = ANY($1::int[])`,
+      [slice]
+    );
+    for (const row of r.rows) {
+      meta.set(row.id, { name: row.full_name || '', company: row.company || '' });
+    }
+    r.rows.length = 0;
+  }
+  console.log(`[dedup] meta fetched for ${meta.size} candidates (${Date.now() - t0}ms)`);
+
+  // ----- Step 4: Typed-array union-find -----
+  const N = candidateIdArr.length;
+  const idToIdx = new Map();
+  for (let i = 0; i < N; i++) idToIdx.set(candidateIdArr[i], i);
+  const idxToId = candidateIdArr; // alias — same array
+
   const parent = new Int32Array(N);
-  const rank = new Int8Array(N);
+  const rankArr = new Int8Array(N);
   for (let i = 0; i < N; i++) parent[i] = i;
 
   function find(i) {
@@ -241,90 +282,132 @@ async function computeDuplicatesStreaming(client, emit) {
   function union(a, b) {
     const ra = find(a), rb = find(b);
     if (ra === rb) return;
-    if (rank[ra] < rank[rb]) parent[ra] = rb;
-    else if (rank[ra] > rank[rb]) parent[rb] = ra;
-    else { parent[rb] = ra; rank[ra]++; }
+    if (rankArr[ra] < rankArr[rb]) parent[ra] = rb;
+    else if (rankArr[ra] > rankArr[rb]) parent[rb] = ra;
+    else { parent[rb] = ra; rankArr[ra]++; }
   }
 
+  // Weak pair store. Keyed by "minId-maxId" to dedupe across signal groups.
+  // These will NOT participate in union-find — they're emitted as standalone pair groups.
+  const weakPairs = new Map(); // key -> [minId, maxId, signal]
+  function addWeakPair(idA, idB, signal) {
+    const min = idA < idB ? idA : idB;
+    const max = idA < idB ? idB : idA;
+    const k = `${min}-${max}`;
+    if (weakPairs.has(k)) return;
+    weakPairs.set(k, [min, max, signal]);
+  }
+
+  // ----- Step 5: Process email signal groups -----
+  // Rule: same email + same name + companies match ≥85%  →  STRONG (union)
+  //       same email + same name + companies differ/blank →  WEAK PAIR
+  //       same email + different name                     →  NO EDGE (was the bridge bug)
   for (const arr of emailArrays) {
-    const i0 = idToIdx.get(arr[0]);
-    for (let k = 1; k < arr.length; k++) union(i0, idToIdx.get(arr[k]));
-  }
-  emailArrays.length = 0; // free
-
-  for (const arr of phoneArrays) {
-    const i0 = idToIdx.get(arr[0]);
-    for (let k = 1; k < arr.length; k++) union(i0, idToIdx.get(arr[k]));
-  }
-  phoneArrays.length = 0; // free
-
-  // ----- Step 4: Name + fuzzy company (needs companies for small name groups) -----
-  if (nameArrays.length > 0) {
-    const nameGroupIds = new Set();
-    for (const arr of nameArrays) for (const id of arr) nameGroupIds.add(id);
-
-    const companyById = new Map();
-    const idsToFetch = Array.from(nameGroupIds);
-    const FETCH_CHUNK = 5000;
-    for (let i = 0; i < idsToFetch.length; i += FETCH_CHUNK) {
-      const slice = idsToFetch.slice(i, i + FETCH_CHUNK);
-      const r = await client.query(
-        `SELECT id, company FROM leads WHERE id = ANY($1::int[]) AND company <> ''`,
-        [slice]
-      );
-      for (const row of r.rows) companyById.set(row.id, row.company);
-    }
-
-    for (const arr of nameArrays) {
-      for (let i = 0; i < arr.length - 1; i++) {
-        const c1 = companyById.get(arr[i]);
-        if (!c1) continue;
-        const idx1 = idToIdx.get(arr[i]);
-        for (let j = i + 1; j < arr.length; j++) {
-          const c2 = companyById.get(arr[j]);
-          if (!c2) continue;
-          if (stringSimilarity(c1, c2) >= 0.85) {
-            union(idx1, idToIdx.get(arr[j]));
-          }
+    for (let i = 0; i < arr.length - 1; i++) {
+      const a = meta.get(arr[i]);
+      if (!a || !a.name) continue;
+      for (let j = i + 1; j < arr.length; j++) {
+        const b = meta.get(arr[j]);
+        if (!b || !b.name) continue;
+        if (a.name !== b.name) continue;
+        if (companiesMatch(a.company, b.company)) {
+          union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
+        } else {
+          addWeakPair(arr[i], arr[j], 'email');
         }
       }
     }
-    companyById.clear();
   }
-  nameArrays.length = 0; // free
+  emailArrays.length = 0;
 
-  console.log(`[dedup] union-find done (${Date.now() - t0}ms)`);
+  // ----- Step 6: Process phone signal groups (same rules) -----
+  for (const arr of phoneArrays) {
+    for (let i = 0; i < arr.length - 1; i++) {
+      const a = meta.get(arr[i]);
+      if (!a || !a.name) continue;
+      for (let j = i + 1; j < arr.length; j++) {
+        const b = meta.get(arr[j]);
+        if (!b || !b.name) continue;
+        if (a.name !== b.name) continue;
+        if (companiesMatch(a.company, b.company)) {
+          union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
+        } else {
+          addWeakPair(arr[i], arr[j], 'phone');
+        }
+      }
+    }
+  }
+  phoneArrays.length = 0;
 
-  // ----- Step 5: Collect groups by root, keep only size >= 2 -----
+  // ----- Step 7: Process name signal groups (Name + Company≥85%) -----
+  // Unchanged from v5. This rule already required company similarity, so it stays strong.
+  for (const arr of nameArrays) {
+    for (let i = 0; i < arr.length - 1; i++) {
+      const a = meta.get(arr[i]);
+      if (!a || !a.company) continue;
+      for (let j = i + 1; j < arr.length; j++) {
+        const b = meta.get(arr[j]);
+        if (!b || !b.company) continue;
+        if (companiesMatch(a.company, b.company)) {
+          union(idToIdx.get(arr[i]), idToIdx.get(arr[j]));
+        }
+      }
+    }
+  }
+  nameArrays.length = 0;
+
+  console.log(`[dedup] union-find done, ${weakPairs.size} candidate weak pairs (${Date.now() - t0}ms)`);
+
+  // ----- Step 8: Collect strong groups (size ≥ 2) -----
   const rootToGroup = new Map();
   for (let i = 0; i < N; i++) {
     const r = find(i);
     if (!rootToGroup.has(r)) rootToGroup.set(r, []);
     rootToGroup.get(r).push(idxToId[i]);
   }
-
-  const finalGroups = [];
+  const strongGroups = [];
   for (const [, ids] of rootToGroup) {
-    if (ids.length >= 2) finalGroups.push(ids);
+    if (ids.length >= 2) strongGroups.push(ids);
   }
-
-  // Free union-find structures
-  idToIdx.clear();
-  idxToId.length = 0;
   rootToGroup.clear();
-  console.log(`[dedup] ${finalGroups.length} groups identified`);
 
-  if (finalGroups.length === 0) return 0;
+  // ----- Step 9: Filter weak pairs — drop ones already inside a strong group -----
+  // If both members of a weak pair landed in the same strong component (via some
+  // other path), the pair is redundant — they're already shown together.
+  const weakPairList = [];
+  for (const [, pair] of weakPairs) {
+    const ra = find(idToIdx.get(pair[0]));
+    const rb = find(idToIdx.get(pair[1]));
+    if (ra === rb) continue;
+    weakPairList.push(pair);
+  }
+  weakPairs.clear();
 
-  // ----- Step 6: Fetch full data + emit groups in batches -----
+  console.log(`[dedup] ${strongGroups.length} strong groups, ${weakPairList.length} weak pair groups`);
+
+  meta.clear();
+  idToIdx.clear();
+
+  if (strongGroups.length === 0 && weakPairList.length === 0) return 0;
+
+  // ----- Step 10: Combined emit list (strong groups + weak pairs) -----
+  const allGroupsToEmit = [];
+  for (const ids of strongGroups) allGroupsToEmit.push({ type: 'strong', ids });
+  for (const pair of weakPairList) {
+    allGroupsToEmit.push({ type: 'weak', ids: [pair[0], pair[1]], weakSignal: pair[2] });
+  }
+  strongGroups.length = 0;
+  weakPairList.length = 0;
+
+  // ----- Step 11: Fetch full lead data + emit in batches -----
   const priOrder = ['critical', 'high', 'medium', 'regular', 'none'];
   const GROUPS_PER_BATCH = 100;
   let emitted = 0;
 
-  for (let b = 0; b < finalGroups.length; b += GROUPS_PER_BATCH) {
-    const batch = finalGroups.slice(b, b + GROUPS_PER_BATCH);
+  for (let b = 0; b < allGroupsToEmit.length; b += GROUPS_PER_BATCH) {
+    const batch = allGroupsToEmit.slice(b, b + GROUPS_PER_BATCH);
     const allIds = [];
-    for (const g of batch) for (const id of g) allIds.push(id);
+    for (const g of batch) for (const id of g.ids) allIds.push(id);
 
     const r = await client.query(`
       SELECT l.id, l.batch_id,
@@ -357,19 +440,22 @@ async function computeDuplicatesStreaming(client, emit) {
         company: row.company
       });
     }
-    r.rows.length = 0; // free pg rows
+    r.rows.length = 0;
 
-    for (const ids of batch) {
+    for (const g of batch) {
       const gl = [];
-      for (const id of ids) {
+      for (const id of g.ids) {
         const l = fullById.get(id);
         if (l) gl.push(l);
       }
       if (gl.length < 2) continue;
       gl.sort((a, c) => new Date(a.dateStr) - new Date(c.dateStr));
 
+      const isWeak = g.type === 'weak';
       gl[0].matchType = 'Original';
-      for (let i = 1; i < gl.length; i++) gl[i].matchType = determineMatchType(gl[i], gl);
+      for (let i = 1; i < gl.length; i++) {
+        gl[i].matchType = determineMatchType(gl[i], gl, isWeak);
+      }
 
       let priority = 'none';
       for (let i = 0; i < gl.length - 1; i++) {
@@ -386,14 +472,16 @@ async function computeDuplicatesStreaming(client, emit) {
         priority,
         isCrossBatch: batchIds.size > 1,
         batchCount: batchIds.size,
-        occurrenceCount: gl.length
+        occurrenceCount: gl.length,
+        matchStrength: isWeak ? 'weak' : 'strong',
+        weakSignal: g.weakSignal || null
       });
       emitted++;
     }
-
     fullById.clear();
   }
 
+  allGroupsToEmit.length = 0;
   console.log(`[dedup] emitted ${emitted} groups in ${Date.now() - t0}ms`);
   return emitted;
 }
