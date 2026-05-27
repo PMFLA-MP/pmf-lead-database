@@ -352,7 +352,21 @@ app.post('/api/batches', requireAuth, async (req, res) => {
 
 app.get('/api/duplicates', requireAuth, async (req, res) => {
   try {
+    // SCALABILITY FIX:
+    // Instead of loading every lead, pre-filter to only "candidate" leads
+    // that share email/phone/name with at least one other lead.
+    // Unique leads (the vast majority) can't be duplicates anyway, so we skip them.
+    // This keeps memory usage bounded even with millions of leads in the DB.
     const r = await pool.query(`
+      WITH dup_emails AS (
+        SELECT email FROM leads WHERE email <> '' GROUP BY email HAVING COUNT(*) > 1
+      ),
+      dup_phones AS (
+        SELECT normalized_phone FROM leads WHERE normalized_phone <> '' GROUP BY normalized_phone HAVING COUNT(*) > 1
+      ),
+      dup_names AS (
+        SELECT full_name FROM leads WHERE full_name <> '' GROUP BY full_name HAVING COUNT(*) > 1
+      )
       SELECT l.id, l.batch_id,
              b.name AS batch_name, b.lead_info_api AS batch_lead_info_api,
              l.date_received, l.source, l.lead_info_api, l.lead_date_api,
@@ -360,6 +374,9 @@ app.get('/api/duplicates', requireAuth, async (req, res) => {
              l.normalized_phone, l.company
       FROM leads l
       JOIN batches b ON b.id = l.batch_id
+      WHERE (l.email <> '' AND l.email IN (SELECT email FROM dup_emails))
+         OR (l.normalized_phone <> '' AND l.normalized_phone IN (SELECT normalized_phone FROM dup_phones))
+         OR (l.full_name <> '' AND l.full_name IN (SELECT full_name FROM dup_names))
     `);
 
     const leads = r.rows.map(row => ({
