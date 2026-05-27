@@ -1,8 +1,7 @@
 require('dotenv').config();
 // ============================================================
-// PMF Lead Database — Backend API
+// PMF Lead Database — Backend API (v3: SQL-driven dedup)
 // Node.js + Express + PostgreSQL
-// Deploy: Render (or any Node host) + Neon Postgres
 // ============================================================
 
 const express = require('express');
@@ -32,8 +31,6 @@ function requireAuth(req, res, next) {
 
 // ============================================================
 // SANITIZATION
-// Treat common "no data" sentinel strings as empty so they
-// don't get stored as real values and matched against each other.
 // ============================================================
 const SENTINEL_VALUES = new Set([
   '', 'not found', 'n/a', 'na', 'none', 'null', 'unknown',
@@ -83,6 +80,9 @@ async function initDb() {
   console.log('[init] Database schema ready');
 }
 
+// ============================================================
+// HELPERS
+// ============================================================
 function normalizePhone(phone) {
   if (!phone) return '';
   return String(phone).replace(/\D/g, '');
@@ -114,105 +114,206 @@ function getPriorityLevel(days) {
   return 'none';
 }
 
-function findDuplicates(leads) {
-  const n = leads.length;
-  if (n === 0) return [];
+function determineMatchType(lead, group) {
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.fullName && lead.fullName === o.fullName && lead.email && lead.email === o.email) return 'Name + Email';
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.fullName && lead.fullName === o.fullName && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Name + Phone';
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.fullName && lead.fullName === o.fullName && lead.company && o.company) {
+      const sim = stringSimilarity(lead.company, o.company);
+      if (sim >= 0.85) return `Name + Company (${Math.round(sim*100)}%)`;
+    }
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
+        && lead.email && lead.email === o.email) return 'Company + Email';
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
+        && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Company + Phone';
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.email && lead.email === o.email) return 'Email only';
+  }
+  for (const o of group) {
+    if (o === lead) continue;
+    if (lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Phone only';
+  }
+  return 'Linked via chain';
+}
 
-  const parent = Array.from({length: n}, (_, i) => i);
-  const rank = new Array(n).fill(0);
+// ============================================================
+// SQL-DRIVEN DEDUP
+// Pushes the heavy lifting into Postgres so memory stays bounded.
+// ============================================================
+async function computeDuplicates(client) {
+  console.log('[dedup] starting');
+  const t0 = Date.now();
 
-  function find(i) {
-    let root = i;
-    while (parent[root] !== root) root = parent[root];
-    while (parent[i] !== root) { const next = parent[i]; parent[i] = root; i = next; }
+  // Step 1: SQL identifies all duplicate signals — returns just lead IDs
+  // grouped by each matching key. Tiny payload, fast with indexes.
+  const [emailGroups, phoneGroups, nameGroups] = await Promise.all([
+    client.query(`
+      SELECT array_agg(id ORDER BY id) AS lead_ids
+      FROM leads
+      WHERE email <> ''
+      GROUP BY email
+      HAVING COUNT(*) > 1
+    `),
+    client.query(`
+      SELECT array_agg(id ORDER BY id) AS lead_ids
+      FROM leads
+      WHERE normalized_phone <> ''
+      GROUP BY normalized_phone
+      HAVING COUNT(*) > 1
+    `),
+    client.query(`
+      SELECT array_agg(id ORDER BY id) AS lead_ids
+      FROM leads
+      WHERE full_name <> ''
+      GROUP BY full_name
+      HAVING COUNT(*) > 1
+    `)
+  ]);
+
+  console.log(`[dedup] signals: ${emailGroups.rows.length} email, ${phoneGroups.rows.length} phone, ${nameGroups.rows.length} name (${Date.now() - t0}ms)`);
+
+  // Step 2: Collect candidate IDs (only leads with at least one duplicate signal)
+  const candidateIds = new Set();
+  for (const row of emailGroups.rows) {
+    for (const id of row.lead_ids) candidateIds.add(id);
+  }
+  for (const row of phoneGroups.rows) {
+    for (const id of row.lead_ids) candidateIds.add(id);
+  }
+  // Skip pathologically large name groups (common names like "John Smith")
+  // since they're almost always false-positive matches anyway
+  for (const row of nameGroups.rows) {
+    if (row.lead_ids.length <= 100) {
+      for (const id of row.lead_ids) candidateIds.add(id);
+    }
+  }
+
+  if (candidateIds.size === 0) {
+    console.log('[dedup] no candidates found');
+    return [];
+  }
+
+  console.log(`[dedup] ${candidateIds.size} candidate leads`);
+
+  // Step 3: Fetch full data for candidates only
+  const ids = Array.from(candidateIds);
+  const leadsResult = await client.query(`
+    SELECT l.id, l.batch_id,
+           b.name AS batch_name, b.lead_info_api AS batch_lead_info_api,
+           l.date_received, l.source, l.lead_info_api, l.lead_date_api,
+           l.first_name, l.last_name, l.full_name, l.email, l.phone,
+           l.normalized_phone, l.company
+    FROM leads l
+    JOIN batches b ON b.id = l.batch_id
+    WHERE l.id = ANY($1::int[])
+  `, [ids]);
+
+  const leadById = new Map();
+  for (const row of leadsResult.rows) {
+    leadById.set(row.id, {
+      id: row.id,
+      batchId: row.batch_id,
+      batchName: row.batch_name,
+      batchLeadInfoApi: row.batch_lead_info_api,
+      dateStr: row.date_received ? row.date_received.toISOString() : null,
+      displayDate: row.date_received ? new Date(row.date_received).toLocaleDateString() : '',
+      source: row.source,
+      leadInfoApi: row.lead_info_api,
+      leadDateApi: row.lead_date_api,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      fullName: row.full_name,
+      email: row.email,
+      phone: row.phone,
+      normalizedPhone: row.normalized_phone,
+      company: row.company
+    });
+  }
+
+  // Step 4: Union-Find on lead IDs only (tiny memory footprint)
+  const parent = new Map();
+  const rank = new Map();
+  for (const id of ids) parent.set(id, id);
+
+  function find(id) {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root);
+    let cur = id;
+    while (parent.get(cur) !== root) {
+      const next = parent.get(cur);
+      parent.set(cur, root);
+      cur = next;
+    }
     return root;
   }
-  function union(i, j) {
-    const ri = find(i), rj = find(j);
-    if (ri === rj) return;
-    if (rank[ri] < rank[rj]) parent[ri] = rj;
-    else if (rank[ri] > rank[rj]) parent[rj] = ri;
-    else { parent[rj] = ri; rank[ri]++; }
+  function union(a, b) {
+    const ra = find(a), rb = find(b);
+    if (ra === rb) return;
+    const rankA = rank.get(ra) || 0;
+    const rankB = rank.get(rb) || 0;
+    if (rankA < rankB) parent.set(ra, rb);
+    else if (rankA > rankB) parent.set(rb, ra);
+    else { parent.set(rb, ra); rank.set(ra, rankA + 1); }
   }
 
-  const emailIdx = {}, phoneIdx = {}, nameIdx = {};
-  leads.forEach((l, i) => {
-    if (l.email) (emailIdx[l.email] = emailIdx[l.email] || []).push(i);
-    if (l.normalizedPhone) (phoneIdx[l.normalizedPhone] = phoneIdx[l.normalizedPhone] || []).push(i);
-    if (l.fullName) (nameIdx[l.fullName] = nameIdx[l.fullName] || []).push(i);
-  });
-
-  for (const k in emailIdx) {
-    const arr = emailIdx[k];
+  // Union by email
+  for (const row of emailGroups.rows) {
+    const arr = row.lead_ids;
     for (let i = 1; i < arr.length; i++) union(arr[0], arr[i]);
   }
-  for (const k in phoneIdx) {
-    const arr = phoneIdx[k];
+  // Union by phone
+  for (const row of phoneGroups.rows) {
+    const arr = row.lead_ids;
     for (let i = 1; i < arr.length; i++) union(arr[0], arr[i]);
   }
-  for (const k in nameIdx) {
-    const arr = nameIdx[k];
-    if (arr.length < 2) continue;
+  // Union by name + similar company (the fuzzy step — only runs on small name groups)
+  for (const row of nameGroups.rows) {
+    const arr = row.lead_ids;
+    if (arr.length < 2 || arr.length > 100) continue;
     for (let i = 0; i < arr.length - 1; i++) {
+      const l1 = leadById.get(arr[i]);
+      if (!l1 || !l1.company) continue;
       for (let j = i + 1; j < arr.length; j++) {
-        const l1 = leads[arr[i]], l2 = leads[arr[j]];
-        if (l1.company && l2.company && stringSimilarity(l1.company, l2.company) >= 0.85) {
+        const l2 = leadById.get(arr[j]);
+        if (!l2 || !l2.company) continue;
+        if (stringSimilarity(l1.company, l2.company) >= 0.85) {
           union(arr[i], arr[j]);
         }
       }
     }
   }
 
-  const groupMap = {};
-  for (let i = 0; i < n; i++) {
-    const r = find(i);
-    (groupMap[r] = groupMap[r] || []).push(i);
+  // Step 5: Group leads by their root
+  const groupMap = new Map();
+  for (const id of ids) {
+    const root = find(id);
+    if (!groupMap.has(root)) groupMap.set(root, []);
+    groupMap.get(root).push(id);
   }
 
-  function determineMatchType(lead, group) {
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.fullName && lead.fullName === o.fullName && lead.email && lead.email === o.email) return 'Name + Email';
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.fullName && lead.fullName === o.fullName && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Name + Phone';
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.fullName && lead.fullName === o.fullName && lead.company && o.company) {
-        const sim = stringSimilarity(lead.company, o.company);
-        if (sim >= 0.85) return `Name + Company (${Math.round(sim*100)}%)`;
-      }
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
-          && lead.email && lead.email === o.email) return 'Company + Email';
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.company && o.company && lead.company.toLowerCase().trim() === o.company.toLowerCase().trim()
-          && lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Company + Phone';
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.email && lead.email === o.email) return 'Email only';
-    }
-    for (const o of group) {
-      if (o === lead) continue;
-      if (lead.normalizedPhone && lead.normalizedPhone === o.normalizedPhone) return 'Phone only';
-    }
-    return 'Linked via chain';
-  }
-
+  // Step 6: Build final group objects
   const groups = [];
   const priOrder = ['critical', 'high', 'medium', 'regular', 'none'];
 
-  for (const root in groupMap) {
-    const indices = groupMap[root];
-    if (indices.length < 2) continue;
-    const gl = indices.map(i => ({ ...leads[i] }));
+  for (const [, groupIds] of groupMap) {
+    if (groupIds.length < 2) continue;
+    const gl = groupIds.map(id => leadById.get(id)).filter(Boolean);
+    if (gl.length < 2) continue;
     gl.sort((a, b) => new Date(a.dateStr) - new Date(b.dateStr));
 
     gl[0].matchType = 'Original';
@@ -236,13 +337,14 @@ function findDuplicates(leads) {
       occurrenceCount: gl.length
     });
   }
+
+  console.log(`[dedup] done: ${groups.length} groups in ${Date.now() - t0}ms`);
   return groups;
 }
 
 // ============================================================
 // ROUTES
 // ============================================================
-
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.get('/api/stats', requireAuth, async (req, res) => {
@@ -351,58 +453,15 @@ app.post('/api/batches', requireAuth, async (req, res) => {
 });
 
 app.get('/api/duplicates', requireAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    // SCALABILITY FIX:
-    // Instead of loading every lead, pre-filter to only "candidate" leads
-    // that share email/phone/name with at least one other lead.
-    // Unique leads (the vast majority) can't be duplicates anyway, so we skip them.
-    // This keeps memory usage bounded even with millions of leads in the DB.
-    const r = await pool.query(`
-      WITH dup_emails AS (
-        SELECT email FROM leads WHERE email <> '' GROUP BY email HAVING COUNT(*) > 1
-      ),
-      dup_phones AS (
-        SELECT normalized_phone FROM leads WHERE normalized_phone <> '' GROUP BY normalized_phone HAVING COUNT(*) > 1
-      ),
-      dup_names AS (
-        SELECT full_name FROM leads WHERE full_name <> '' GROUP BY full_name HAVING COUNT(*) > 1
-      )
-      SELECT l.id, l.batch_id,
-             b.name AS batch_name, b.lead_info_api AS batch_lead_info_api,
-             l.date_received, l.source, l.lead_info_api, l.lead_date_api,
-             l.first_name, l.last_name, l.full_name, l.email, l.phone,
-             l.normalized_phone, l.company
-      FROM leads l
-      JOIN batches b ON b.id = l.batch_id
-      WHERE (l.email <> '' AND l.email IN (SELECT email FROM dup_emails))
-         OR (l.normalized_phone <> '' AND l.normalized_phone IN (SELECT normalized_phone FROM dup_phones))
-         OR (l.full_name <> '' AND l.full_name IN (SELECT full_name FROM dup_names))
-    `);
-
-    const leads = r.rows.map(row => ({
-      id: row.id,
-      batchId: row.batch_id,
-      batchName: row.batch_name,
-      batchLeadInfoApi: row.batch_lead_info_api,
-      dateStr: row.date_received ? row.date_received.toISOString() : null,
-      displayDate: row.date_received ? new Date(row.date_received).toLocaleDateString() : '',
-      source: row.source,
-      leadInfoApi: row.lead_info_api,
-      leadDateApi: row.lead_date_api,
-      firstName: row.first_name,
-      lastName: row.last_name,
-      fullName: row.full_name,
-      email: row.email,
-      phone: row.phone,
-      normalizedPhone: row.normalized_phone,
-      company: row.company
-    }));
-
-    const groups = findDuplicates(leads);
-    res.json({ totalLeads: leads.length, totalGroups: groups.length, groups });
+    const groups = await computeDuplicates(client);
+    res.json({ totalGroups: groups.length, groups });
   } catch (e) {
     console.error('[GET /api/duplicates]', e);
     res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
