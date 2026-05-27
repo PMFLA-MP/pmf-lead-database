@@ -1,6 +1,6 @@
 require('dotenv').config();
 // ============================================================
-// PMF Lead Database — Backend API (v4: two-pass + streaming)
+// PMF Lead Database — Backend API (v5: typed arrays + batched streaming)
 // Node.js + Express + PostgreSQL
 // ============================================================
 
@@ -36,7 +36,6 @@ const SENTINEL_VALUES = new Set([
   '', 'not found', 'n/a', 'na', 'none', 'null', 'unknown',
   '-', '--', '#n/a', '#null', 'nil', 'no data', 'tbd', 'pending'
 ]);
-
 function blank(v) {
   if (v === null || v === undefined) return '';
   const s = String(v).trim();
@@ -152,96 +151,89 @@ function determineMatchType(lead, group) {
 }
 
 // ============================================================
-// SQL-DRIVEN DEDUP (two-pass + streaming)
+// DEDUP — typed arrays + batched fetching + streaming
 //
-// Pass 1: Load LITE data (id + match keys only) for union-find.
-// Pass 2: Load FULL data only for leads actually in final groups.
-// Stream:  Emit groups one at a time so the response never lives in memory.
+// Designed to handle 500k+ candidate leads in <200MB RAM.
+// Key tricks:
+//   - Union-Find uses Int32Array (2MB for 500k IDs instead of 40MB+ Map)
+//   - Companies fetched only for small name groups (not all candidates)
+//   - Full lead data fetched lazily in batches of 100 groups at a time
+//   - Each batch emitted to the response stream then freed
 // ============================================================
 async function computeDuplicatesStreaming(client, emit) {
   console.log('[dedup] starting');
   const t0 = Date.now();
 
-  // ----- Step 1: Find duplicate signals in SQL -----
+  // ----- Step 1: Get signal groups (just ID arrays, no lead data) -----
   const [emailGroups, phoneGroups, nameGroups] = await Promise.all([
     client.query(`
       SELECT array_agg(id ORDER BY id) AS lead_ids
-      FROM leads
-      WHERE email <> ''
-      GROUP BY email
-      HAVING COUNT(*) > 1
+      FROM leads WHERE email <> ''
+      GROUP BY email HAVING COUNT(*) > 1
     `),
     client.query(`
       SELECT array_agg(id ORDER BY id) AS lead_ids
-      FROM leads
-      WHERE normalized_phone <> ''
-      GROUP BY normalized_phone
-      HAVING COUNT(*) > 1
+      FROM leads WHERE normalized_phone <> ''
+      GROUP BY normalized_phone HAVING COUNT(*) > 1
     `),
     client.query(`
       SELECT array_agg(id ORDER BY id) AS lead_ids
-      FROM leads
-      WHERE full_name <> ''
-      GROUP BY full_name
-      HAVING COUNT(*) > 1
+      FROM leads WHERE full_name <> ''
+      GROUP BY full_name HAVING COUNT(*) > 1
     `)
   ]);
-
   console.log(`[dedup] signals: ${emailGroups.rows.length} email / ${phoneGroups.rows.length} phone / ${nameGroups.rows.length} name (${Date.now() - t0}ms)`);
 
-  // ----- Step 2: Candidate IDs -----
-  const candidateIds = new Set();
-  for (const row of emailGroups.rows) {
-    for (const id of row.lead_ids) candidateIds.add(id);
-  }
-  for (const row of phoneGroups.rows) {
-    for (const id of row.lead_ids) candidateIds.add(id);
-  }
-  // Skip pathologically large name groups (common names) — almost always false positives
+  // Extract just the ID arrays — drop the row wrapper objects to save memory
+  const emailArrays = emailGroups.rows.map(r => r.lead_ids);
+  const phoneArrays = phoneGroups.rows.map(r => r.lead_ids);
+  // For names, filter to small groups only (skip pathologically common names)
+  const nameArrays = [];
   for (const row of nameGroups.rows) {
-    if (row.lead_ids.length <= 100) {
-      for (const id of row.lead_ids) candidateIds.add(id);
+    if (row.lead_ids.length >= 2 && row.lead_ids.length <= 100) {
+      nameArrays.push(row.lead_ids);
     }
   }
+  // Free row wrappers
+  emailGroups.rows.length = 0;
+  phoneGroups.rows.length = 0;
+  nameGroups.rows.length = 0;
 
-  if (candidateIds.size === 0) {
+  // ----- Step 2: Assign positions for typed-array union-find -----
+  const idToIdx = new Map();
+  const idxToId = [];
+  function getIdx(id) {
+    let idx = idToIdx.get(id);
+    if (idx === undefined) {
+      idx = idxToId.length;
+      idToIdx.set(id, idx);
+      idxToId.push(id);
+    }
+    return idx;
+  }
+  for (const arr of emailArrays) for (const id of arr) getIdx(id);
+  for (const arr of phoneArrays) for (const id of arr) getIdx(id);
+  for (const arr of nameArrays) for (const id of arr) getIdx(id);
+
+  const N = idxToId.length;
+  if (N === 0) {
     console.log('[dedup] no candidates');
     return 0;
   }
-  console.log(`[dedup] ${candidateIds.size} candidates`);
+  console.log(`[dedup] ${N} candidates`);
 
-  // ----- Step 3: Load LITE data (just for union-find) -----
-  const candidateArr = Array.from(candidateIds);
-  const liteResult = await client.query(`
-    SELECT id, full_name, company, email, normalized_phone
-    FROM leads
-    WHERE id = ANY($1::int[])
-  `, [candidateArr]);
+  // ----- Step 3: Union-Find with typed arrays (compact memory) -----
+  const parent = new Int32Array(N);
+  const rank = new Int8Array(N);
+  for (let i = 0; i < N; i++) parent[i] = i;
 
-  const liteById = new Map();
-  for (const row of liteResult.rows) {
-    liteById.set(row.id, {
-      fullName: row.full_name,
-      company: row.company,
-      email: row.email,
-      normalizedPhone: row.normalized_phone
-    });
-  }
-  // Hint GC: drop the raw rows
-  liteResult.rows.length = 0;
-
-  // ----- Step 4: Union-Find on lead IDs -----
-  const parent = new Map();
-  const rank = new Map();
-  for (const id of candidateArr) parent.set(id, id);
-
-  function find(id) {
-    let root = id;
-    while (parent.get(root) !== root) root = parent.get(root);
-    let cur = id;
-    while (parent.get(cur) !== root) {
-      const next = parent.get(cur);
-      parent.set(cur, root);
+  function find(i) {
+    let root = i;
+    while (parent[root] !== root) root = parent[root];
+    let cur = i;
+    while (parent[cur] !== root) {
+      const next = parent[cur];
+      parent[cur] = root;
       cur = next;
     }
     return root;
@@ -249,79 +241,102 @@ async function computeDuplicatesStreaming(client, emit) {
   function union(a, b) {
     const ra = find(a), rb = find(b);
     if (ra === rb) return;
-    const rA = rank.get(ra) || 0, rB = rank.get(rb) || 0;
-    if (rA < rB) parent.set(ra, rb);
-    else if (rA > rB) parent.set(rb, ra);
-    else { parent.set(rb, ra); rank.set(ra, rA + 1); }
+    if (rank[ra] < rank[rb]) parent[ra] = rb;
+    else if (rank[ra] > rank[rb]) parent[rb] = ra;
+    else { parent[rb] = ra; rank[ra]++; }
   }
 
-  for (const row of emailGroups.rows) {
-    const a = row.lead_ids;
-    for (let i = 1; i < a.length; i++) union(a[0], a[i]);
+  for (const arr of emailArrays) {
+    const i0 = idToIdx.get(arr[0]);
+    for (let k = 1; k < arr.length; k++) union(i0, idToIdx.get(arr[k]));
   }
-  for (const row of phoneGroups.rows) {
-    const a = row.lead_ids;
-    for (let i = 1; i < a.length; i++) union(a[0], a[i]);
+  emailArrays.length = 0; // free
+
+  for (const arr of phoneArrays) {
+    const i0 = idToIdx.get(arr[0]);
+    for (let k = 1; k < arr.length; k++) union(i0, idToIdx.get(arr[k]));
   }
-  for (const row of nameGroups.rows) {
-    const a = row.lead_ids;
-    if (a.length < 2 || a.length > 100) continue;
-    for (let i = 0; i < a.length - 1; i++) {
-      const l1 = liteById.get(a[i]);
-      if (!l1 || !l1.company) continue;
-      for (let j = i + 1; j < a.length; j++) {
-        const l2 = liteById.get(a[j]);
-        if (!l2 || !l2.company) continue;
-        if (stringSimilarity(l1.company, l2.company) >= 0.85) union(a[i], a[j]);
+  phoneArrays.length = 0; // free
+
+  // ----- Step 4: Name + fuzzy company (needs companies for small name groups) -----
+  if (nameArrays.length > 0) {
+    const nameGroupIds = new Set();
+    for (const arr of nameArrays) for (const id of arr) nameGroupIds.add(id);
+
+    const companyById = new Map();
+    const idsToFetch = Array.from(nameGroupIds);
+    const FETCH_CHUNK = 5000;
+    for (let i = 0; i < idsToFetch.length; i += FETCH_CHUNK) {
+      const slice = idsToFetch.slice(i, i + FETCH_CHUNK);
+      const r = await client.query(
+        `SELECT id, company FROM leads WHERE id = ANY($1::int[]) AND company <> ''`,
+        [slice]
+      );
+      for (const row of r.rows) companyById.set(row.id, row.company);
+    }
+
+    for (const arr of nameArrays) {
+      for (let i = 0; i < arr.length - 1; i++) {
+        const c1 = companyById.get(arr[i]);
+        if (!c1) continue;
+        const idx1 = idToIdx.get(arr[i]);
+        for (let j = i + 1; j < arr.length; j++) {
+          const c2 = companyById.get(arr[j]);
+          if (!c2) continue;
+          if (stringSimilarity(c1, c2) >= 0.85) {
+            union(idx1, idToIdx.get(arr[j]));
+          }
+        }
       }
     }
+    companyById.clear();
   }
+  nameArrays.length = 0; // free
+
   console.log(`[dedup] union-find done (${Date.now() - t0}ms)`);
 
-  // ----- Step 5: Group by root, keep only groups of size >= 2 -----
-  const groupMap = new Map();
-  for (const id of candidateArr) {
-    const root = find(id);
-    if (!groupMap.has(root)) groupMap.set(root, []);
-    groupMap.get(root).push(id);
+  // ----- Step 5: Collect groups by root, keep only size >= 2 -----
+  const rootToGroup = new Map();
+  for (let i = 0; i < N; i++) {
+    const r = find(i);
+    if (!rootToGroup.has(r)) rootToGroup.set(r, []);
+    rootToGroup.get(r).push(idxToId[i]);
   }
 
-  const finalGroupIdLists = [];
-  for (const [, ids] of groupMap) {
-    if (ids.length >= 2) finalGroupIdLists.push(ids);
+  const finalGroups = [];
+  for (const [, ids] of rootToGroup) {
+    if (ids.length >= 2) finalGroups.push(ids);
   }
-  console.log(`[dedup] ${finalGroupIdLists.length} groups identified`);
 
-  // Free intermediate structures
-  liteById.clear();
-  parent.clear();
-  rank.clear();
-  groupMap.clear();
+  // Free union-find structures
+  idToIdx.clear();
+  idxToId.length = 0;
+  rootToGroup.clear();
+  console.log(`[dedup] ${finalGroups.length} groups identified`);
 
-  if (finalGroupIdLists.length === 0) return 0;
+  if (finalGroups.length === 0) return 0;
 
-  // ----- Step 6: Load FULL data only for leads in final groups, in chunks -----
-  const finalIdSet = new Set();
-  for (const ids of finalGroupIdLists) {
-    for (const id of ids) finalIdSet.add(id);
-  }
-  const finalIds = Array.from(finalIdSet);
-  console.log(`[dedup] loading full data for ${finalIds.length} leads`);
+  // ----- Step 6: Fetch full data + emit groups in batches -----
+  const priOrder = ['critical', 'high', 'medium', 'regular', 'none'];
+  const GROUPS_PER_BATCH = 100;
+  let emitted = 0;
 
-  const fullById = new Map();
-  const CHUNK = 10000;
-  for (let i = 0; i < finalIds.length; i += CHUNK) {
-    const slice = finalIds.slice(i, i + CHUNK);
+  for (let b = 0; b < finalGroups.length; b += GROUPS_PER_BATCH) {
+    const batch = finalGroups.slice(b, b + GROUPS_PER_BATCH);
+    const allIds = [];
+    for (const g of batch) for (const id of g) allIds.push(id);
+
     const r = await client.query(`
       SELECT l.id, l.batch_id,
              b.name AS batch_name, b.lead_info_api AS batch_lead_info_api,
              l.date_received, l.source, l.lead_info_api, l.lead_date_api,
              l.first_name, l.last_name, l.full_name, l.email, l.phone,
              l.normalized_phone, l.company
-      FROM leads l
-      JOIN batches b ON b.id = l.batch_id
+      FROM leads l JOIN batches b ON b.id = l.batch_id
       WHERE l.id = ANY($1::int[])
-    `, [slice]);
+    `, [allIds]);
+
+    const fullById = new Map();
     for (const row of r.rows) {
       fullById.set(row.id, {
         id: row.id,
@@ -342,45 +357,41 @@ async function computeDuplicatesStreaming(client, emit) {
         company: row.company
       });
     }
-  }
+    r.rows.length = 0; // free pg rows
 
-  // ----- Step 7: Build & emit groups one at a time -----
-  const priOrder = ['critical', 'high', 'medium', 'regular', 'none'];
-  let emitted = 0;
-
-  for (const ids of finalGroupIdLists) {
-    const gl = [];
-    for (const id of ids) {
-      const l = fullById.get(id);
-      if (l) gl.push(l);
-    }
-    if (gl.length < 2) continue;
-    gl.sort((a, b) => new Date(a.dateStr) - new Date(b.dateStr));
-
-    gl[0].matchType = 'Original';
-    for (let i = 1; i < gl.length; i++) gl[i].matchType = determineMatchType(gl[i], gl);
-
-    let priority = 'none';
-    for (let i = 0; i < gl.length - 1; i++) {
-      for (let j = i + 1; j < gl.length; j++) {
-        const days = (new Date(gl[j].dateStr) - new Date(gl[i].dateStr)) / 86400000;
-        const p = getPriorityLevel(days);
-        if (priOrder.indexOf(p) < priOrder.indexOf(priority)) priority = p;
+    for (const ids of batch) {
+      const gl = [];
+      for (const id of ids) {
+        const l = fullById.get(id);
+        if (l) gl.push(l);
       }
+      if (gl.length < 2) continue;
+      gl.sort((a, c) => new Date(a.dateStr) - new Date(c.dateStr));
+
+      gl[0].matchType = 'Original';
+      for (let i = 1; i < gl.length; i++) gl[i].matchType = determineMatchType(gl[i], gl);
+
+      let priority = 'none';
+      for (let i = 0; i < gl.length - 1; i++) {
+        for (let j = i + 1; j < gl.length; j++) {
+          const days = (new Date(gl[j].dateStr) - new Date(gl[i].dateStr)) / 86400000;
+          const p = getPriorityLevel(days);
+          if (priOrder.indexOf(p) < priOrder.indexOf(priority)) priority = p;
+        }
+      }
+
+      const batchIds = new Set(gl.map(l => l.batchId));
+      emit({
+        leads: gl,
+        priority,
+        isCrossBatch: batchIds.size > 1,
+        batchCount: batchIds.size,
+        occurrenceCount: gl.length
+      });
+      emitted++;
     }
 
-    const batchIds = new Set(gl.map(l => l.batchId));
-    emit({
-      leads: gl,
-      priority,
-      isCrossBatch: batchIds.size > 1,
-      batchCount: batchIds.size,
-      occurrenceCount: gl.length
-    });
-    emitted++;
-
-    // Free memory as we go — these leads have been written to the response
-    for (const id of ids) fullById.delete(id);
+    fullById.clear();
   }
 
   console.log(`[dedup] emitted ${emitted} groups in ${Date.now() - t0}ms`);
@@ -469,13 +480,7 @@ app.post('/api/batches', requireAuth, async (req, res) => {
           blank(l.source),
           blank(l.leadInfoApi),
           blank(l.leadDateApi),
-          cFirst,
-          cLast,
-          fullName,
-          cEmail,
-          cPhone,
-          normPhone,
-          cCompany
+          cFirst, cLast, fullName, cEmail, cPhone, normPhone, cCompany
         );
       }
       await client.query(
@@ -497,7 +502,6 @@ app.post('/api/batches', requireAuth, async (req, res) => {
   }
 });
 
-// Streaming duplicates endpoint — writes groups to the response as they're computed
 app.get('/api/duplicates', requireAuth, async (req, res) => {
   const client = await pool.connect();
   let headersSent = false;
@@ -518,10 +522,8 @@ app.get('/api/duplicates', requireAuth, async (req, res) => {
     res.end();
   } catch (e) {
     console.error('[GET /api/duplicates]', e);
-    if (!headersSent) {
-      res.status(500).json({ error: e.message });
-    } else {
-      // Already streaming; close out the JSON gracefully and signal error
+    if (!headersSent) res.status(500).json({ error: e.message });
+    else {
       try { res.write(`],"totalGroups":0,"error":${JSON.stringify(e.message)}}`); } catch (_) {}
       res.end();
     }
